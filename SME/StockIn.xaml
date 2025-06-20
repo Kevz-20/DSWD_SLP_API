@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="SME.StockInPage"
+             Title="Stock-In"
+             BackgroundImageSource="background.png"
+             Shell.NavBarIsVisible="False">
+
+    <ScrollView>
+        <VerticalStackLayout Padding="30" Spacing="16" VerticalOptions="Center">
+
+            <!-- Title -->
+            <Label Text="Add Product"
+                   FontSize="24"
+                   FontAttributes="Bold"
+                   HorizontalOptions="Center"
+                   TextColor="White"
+                   Margin="0,20"/>
+
+            <!-- Stock-In Date -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="12" Padding="10" HasShadow="False">
+                <Grid ColumnDefinitions="Auto, *" VerticalOptions="Center">
+                    <Image Source="calendar.png" WidthRequest="20" HeightRequest="20" Margin="5,0"/>
+                    <Label x:Name="StockInDateLabel"
+                           TextColor="White"
+                           FontSize="16"
+                           VerticalOptions="Center"
+                           HorizontalOptions="Start"
+                           Grid.Column="1"/>
+                </Grid>
+            </Frame>
+
+            <!-- Category Picker -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="12" Padding="10" HasShadow="False">
+                <Picker x:Name="CategoryPicker"
+                        Title="Choose Category"
+                        TitleColor="White"
+                        TextColor="White"
+                        BackgroundColor="Transparent"/>
+            </Frame>
+
+            <!-- Product Name -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="12" Padding="10" HasShadow="False">
+                <Grid ColumnDefinitions="Auto, *" VerticalOptions="Center">
+                    <Image Source="productname.png" WidthRequest="20" HeightRequest="20" Margin="5,0"/>
+                    <Entry x:Name="ProductNameEntry"
+                           Placeholder="Enter Product Name"
+                           PlaceholderColor="White"
+                           TextColor="White"
+                           BackgroundColor="Transparent"
+                           Grid.Column="1"/>
+                </Grid>
+            </Frame>
+
+            <!-- Purchase Price -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="12" Padding="10" HasShadow="False">
+                <Grid ColumnDefinitions="Auto, *" VerticalOptions="Center">
+                    <Image Source="purchaseprice.png" WidthRequest="20" HeightRequest="20" Margin="5,0"/>
+                    <Entry x:Name="PurchasePriceEntry"
+                           Placeholder="Enter Purchase Price"
+                           PlaceholderColor="White"
+                           TextColor="White"
+                           BackgroundColor="Transparent"
+                           Keyboard="Numeric"
+                           Grid.Column="1"/>
+                </Grid>
+            </Frame>
+
+            <!-- Markup Rate -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="12" Padding="10" HasShadow="False">
+                <Grid ColumnDefinitions="Auto, *" VerticalOptions="Center">
+                    <Image Source="sellingprice.png" WidthRequest="20" HeightRequest="20" Margin="5,0"/>
+                    <Entry x:Name="MarkupRateEntry"
+                           Placeholder="Enter Mark Up Rate"
+                           PlaceholderColor="White"
+                           TextColor="White"
+                           BackgroundColor="Transparent"
+                           Keyboard="Numeric"
+                           Grid.Column="1"/>
+                </Grid>
+            </Frame>
+
+            <!-- Quantity -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="12" Padding="10" HasShadow="False">
+                <Grid ColumnDefinitions="Auto, *" VerticalOptions="Center">
+                    <Image Source="quantitystock.png" WidthRequest="20" HeightRequest="20" Margin="5,0"/>
+                    <Entry x:Name="QuantityEntry"
+                           Placeholder="Enter Quantity in Stock"
+                           PlaceholderColor="White"
+                           TextColor="White"
+                           BackgroundColor="Transparent"
+                           Keyboard="Numeric"
+                           Grid.Column="1"/>
+                </Grid>
+            </Frame>
+
+            <!-- Save Button -->
+            <Button Text="Save"
+                    BackgroundColor="#007BFF"
+                    TextColor="White"
+                    CornerRadius="20"
+                    FontAttributes="Bold"
+                    FontSize="18"
+                    Padding="14"
+                    Clicked="OnSaveClicked"/>
+        </VerticalStackLayout>
+    </ScrollView>
+</ContentPage>

@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="SME.RecordExpensesPage"
+             Title="Record Expenses"
+             BackgroundImageSource="background.png"
+             Shell.NavBarIsVisible="False">
+
+    <ScrollView>
+        <VerticalStackLayout Padding="30" Spacing="16" VerticalOptions="Center">
+
+            <!-- Title -->
+            <Label Text="Record Expenses"
+                   FontSize="24"
+                   FontAttributes="Bold"
+                   HorizontalOptions="Center"
+                   TextColor="White"
+                   Margin="0,20"/>
+
+            <!-- Date -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="12" Padding="10" HasShadow="False">
+                <Grid ColumnDefinitions="Auto, *" VerticalOptions="Center">
+                    <Image Source="calendar.png" WidthRequest="20" HeightRequest="20" Margin="5,0"/>
+                    <Label x:Name="DateLabel"
+                           TextColor="White"
+                           FontSize="16"
+                           VerticalOptions="Center"
+                           HorizontalOptions="Start"
+                           Grid.Column="1"/>
+                </Grid>
+            </Frame>
+
+            <!-- Amount -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="12" Padding="10" HasShadow="False">
+                <Grid ColumnDefinitions="Auto, *" VerticalOptions="Center">
+                    <Image Source="peso.png" WidthRequest="20" HeightRequest="20" Margin="5,0"/>
+                    <Entry x:Name="AmountEntry"
+                           Placeholder="Enter Expenses"
+                           PlaceholderColor="White"
+                           TextColor="White"
+                           BackgroundColor="Transparent"
+                           Keyboard="Numeric"
+                           Grid.Column="1"/>
+                </Grid>
+            </Frame>
+            <!-- Category Picker -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="10" Padding="4,0" HasShadow="False">
+                <Grid ColumnDefinitions="*,Auto" VerticalOptions="Center" HeightRequest="44">
+                    <Picker x:Name="CategoryPicker"
+                Title="Expense Category"
+                TitleColor="White"
+                TextColor="White"
+                BackgroundColor="Transparent"
+                FontSize="14"
+                HorizontalOptions="FillAndExpand"
+                Margin="10,0,10,0"
+                VerticalOptions="Center"/>
+                    <ImageButton Source="dropdown_arrow.png"
+                     Grid.Column="1"
+                     WidthRequest="18"
+                     HeightRequest="18"
+                     BackgroundColor="Transparent"
+                     Clicked="OnCategoryArrowTapped"
+                     VerticalOptions="Center"
+                     Margin="0,0,10,0"/>
+                </Grid>
+                <Frame.GestureRecognizers>
+                    <TapGestureRecognizer Tapped="OnCategoryArrowTapped"/>
+                </Frame.GestureRecognizers>
+            </Frame>
+
+            <!-- Description -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="10" Padding="10" HasShadow="False">
+                <Entry x:Name="DescriptionEntry"
+                       Placeholder="Description"
+                       PlaceholderColor="White"
+                       TextColor="White"
+                       FontSize="14"
+                       BackgroundColor="Transparent"/>
+            </Frame>
+
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="10" Padding="10" HasShadow="False">
+                <Frame.GestureRecognizers>
+                    <TapGestureRecognizer Tapped="OnUploadReceiptTapped" />
+                </Frame.GestureRecognizers>
+                <HorizontalStackLayout Spacing="10">
+                    <Image x:Name="SelectedReceiptImage"
+               Source="camera.png"
+               WidthRequest="18"
+               HeightRequest="18"/>
+                    <Label Text="Upload Receipt"
+               TextColor="White"
+               FontSize="14"
+               VerticalOptions="Center"/>
+                </HorizontalStackLayout>
+            </Frame>
+
+            <!-- Save Button -->
+            <Button Text="Save Expense"
+                    BackgroundColor="#007BFF"
+                    TextColor="White"
+                    FontSize="16"
+                    FontAttributes="Bold"
+                    CornerRadius="10"
+                    Padding="12"
+                    Clicked="OnSaveExpenseClicked"/>
+        </VerticalStackLayout>
+    </ScrollView>
+</ContentPage>

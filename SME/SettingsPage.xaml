@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="SME.SettingsPage"
+             Title="SettingsPage"
+             Shell.NavBarIsVisible="False">
+
+
+    <Grid>
+        <!-- Background Image -->
+        <Image Source="background.png"
+               Aspect="AspectFill"
+               Opacity="1"
+               HorizontalOptions="FillAndExpand"
+               VerticalOptions="FillAndExpand" />
+
+        <!-- Foreground Content -->
+        <ScrollView>
+            <VerticalStackLayout Spacing="20" Padding="20">
+
+                <Label Text="Settings"
+                       FontSize="32"
+                       TextColor="White"
+                       HorizontalOptions="Center"/>
+
+                <!-- Full Name -->
+                <Frame BackgroundColor="#13FFFFFF"
+                       CornerRadius="15"
+                       Padding="15"
+                       HasShadow="False">
+                    <Grid ColumnDefinitions="*, Auto" VerticalOptions="Center">
+                        <VerticalStackLayout>
+                            <Label x:Name="FullNameLabel"
+                                   Text="Jesel U. Cardiente"
+                                   TextColor="White"
+                                   FontAttributes="Bold"
+                                   FontSize="16" />
+                            <Label Text="Full Name"
+                                   TextColor="White"
+                                   FontSize="12" />
+                        </VerticalStackLayout>
+                        <Button Text="Change"
+                                TextColor="#4DA6FF"
+                                BackgroundColor="Transparent"
+                                Grid.Column="1"
+                                Clicked="OnChangeFullNameClicked"
+                                VerticalOptions="Center" />
+                    </Grid>
+                </Frame>
+
+                <!-- Change PIN -->
+                <Frame BackgroundColor="#13FFFFFF"
+                       CornerRadius="10"
+                       Padding="10"
+                       HasShadow="False">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <Label Text="Change PIN"
+                               TextColor="White"
+                               VerticalOptions="Center"/>
+                        <Label Text="➔"
+                               TextColor="White"
+                               FontSize="18"
+                               VerticalOptions="Center"
+                               Grid.Column="1">
+                            <Label.GestureRecognizers>
+                                <TapGestureRecognizer Tapped="OnChangePinClicked"/>
+                            </Label.GestureRecognizers>
+                        </Label>
+                    </Grid>
+                </Frame>
+
+                <!-- Security Lock Button -->
+                <Frame BackgroundColor="#13FFFFFF"
+                       CornerRadius="10"
+                       Padding="10"
+                       HasShadow="False">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <Label Text="Security Lock"
+                               TextColor="White"
+                               VerticalOptions="Center"/>
+                        <Label Text="➔"
+                               TextColor="White"
+                               FontSize="18"
+                               VerticalOptions="Center"
+                               Grid.Column="1"/>
+                    </Grid>
+                </Frame>
+
+                <!-- Low Stock Alerts -->
+                <Frame BackgroundColor="#13FFFFFF"
+                       CornerRadius="10"
+                       Padding="10"
+                       HasShadow="False">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <Label Text="Low Stock Alerts"
+                               TextColor="White"
+                               VerticalOptions="Center"/>
+                        <Label Text="5 minutes"
+                               TextColor="White"
+                               VerticalOptions="Center"
+                               Grid.Column="1"/>
+                    </Grid>
+                </Frame>
+
+                <!-- Security Lock Switch -->
+                <Frame BackgroundColor="#13FFFFFF"
+                       CornerRadius="10"
+                       Padding="10"
+                       HasShadow="False">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <Label Text="Security Lock"
+                               TextColor="White"
+                               VerticalOptions="Center"/>
+                        <Switch IsToggled="True"
+                                Toggled="OnSecurityLockToggled"
+                                HorizontalOptions="End"
+                                Grid.Column="1"/>
+                    </Grid>
+                </Frame>
+
+                <!-- Due Date Reminders Switch
+                <Frame BackgroundColor="#13FFFFFF"
+                       CornerRadius="10"
+                       Padding="10"
+                       HasShadow="False">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <Label Text="Due Date Reminders"
+                               TextColor="White"
+                               VerticalOptions="Center"/>
+                        <Switch IsToggled="True"
+                                Toggled="OnDueDateReminderToggled"
+                                HorizontalOptions="End"
+                                Grid.Column="1"/>
+                    </Grid>
+                </Frame> -->
+
+                <!-- Log Out -->
+                <Frame BackgroundColor="#13FFFFFF"
+                       CornerRadius="10"
+                       Padding="10"
+                       HasShadow="False">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <Label Text="Log Out"
+                               TextColor="White"    
+                               VerticalOptions="Center"/>
+                        <Label Text="➔"
+                               TextColor="White"
+                               FontSize="18"
+                               VerticalOptions="Center"
+                               Grid.Column="1">
+                            <Label.GestureRecognizers>
+                                <TapGestureRecognizer Tapped="OnLogOutClicked"/>
+                            </Label.GestureRecognizers>
+                        </Label>
+                    </Grid>
+                </Frame>
+
+            </VerticalStackLayout>
+        </ScrollView>
+    </Grid>
+</ContentPage>

@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:sys="clr-namespace:System;assembly=mscorlib"
+             x:Class="SME.RecordSalesPage"
+             Title="Record Sales"
+             BackgroundImageSource="background.png"
+             Shell.NavBarIsVisible="False">
+
+    <ScrollView>
+        <VerticalStackLayout Padding="30" Spacing="16" VerticalOptions="Center">
+
+            <!-- Date Display -->
+            <Frame BackgroundColor="#13FFFFFF" CornerRadius="12" Padding="10" HasShadow="False">
+                <Grid ColumnDefinitions="Auto, *" VerticalOptions="Center">
+                    <Image Source="calendar.png" WidthRequest="20" HeightRequest="20" Margin="5,0"/>
+                    <Label x:Name="DateLabel"
+                           TextColor="White"
+                           FontSize="16"
+                           VerticalOptions="Center"
+                           HorizontalOptions="Start"
+                           Grid.Column="1"/>
+                </Grid>
+            </Frame>
+
+            <!-- Dynamic Sales Entry List -->
+            <VerticalStackLayout x:Name="SalesEntriesLayout"
+                                 Spacing="16"
+                                 BindableLayout.ItemsSource="{Binding SalesEntries}">
+            </VerticalStackLayout>
+
+            <!-- Product Suggestions -->
+            <CollectionView x:Name="ProductSuggestions"
+                            SelectionChanged="OnProductSelected"
+                            SelectionMode="Single"
+                            IsVisible="False"
+                            HeightRequest="150">
+                <CollectionView.ItemTemplate>
+                    <DataTemplate>
+                        <Label Text="{Binding ProductName}" Padding="10" TextColor="White"/>
+                    </DataTemplate>
+                </CollectionView.ItemTemplate>
+            </CollectionView>
+
+            <!-- Order Total -->
+            <Label x:Name="OrderTotalLabel"
+                   Text="Order Total: ₱0.00"
+                   FontSize="20"
+                   TextColor="White"
+                   HorizontalOptions="Center"
+                   Margin="0,10,0,10"/>
+
+            <!-- Add Sale Button -->
+            <Button Text="Record Another Sale"
+                    BackgroundColor="#13FFFFFF"
+                    TextColor="White"
+                    CornerRadius="10"
+                    FontSize="16"
+                    Clicked="OnAddAnotherSaleClicked"/>
+
+            <!-- Payment Option Selection -->
+            <StackLayout x:Name="PaymentOptionsLayout" IsVisible="False" Spacing="10">
+                <Label Text="Choose Payment Type"
+                       TextColor="White"
+                       FontAttributes="Bold"
+                       FontSize="16"
+                       HorizontalOptions="Center"/>
+                <HorizontalStackLayout Spacing="10">
+                    <Button x:Name="CashButton"
+                            Text="Cash"
+                            BackgroundColor="#2B1A73"
+                            TextColor="White"
+                            BorderColor="White"
+                            BorderWidth="2"
+                            CornerRadius="10"
+                            Clicked="OnCashClicked"/>
+                    <Button x:Name="UtangButton"
+                            Text="Utang"
+                            BackgroundColor="#2B1A73"
+                            TextColor="White"
+                            BorderColor="White"
+                            BorderWidth="2"
+                            CornerRadius="10"
+                            Clicked="OnUtangClicked"/>
+                </HorizontalStackLayout>
+            </StackLayout>
+
+            <!-- UTANG FIELDS -->
+            <StackLayout x:Name="UtangFields" IsVisible="False" Spacing="16">
+
+                <!-- Customer Entry + Add Button -->
+                <Grid ColumnDefinitions="*, Auto" ColumnSpacing="10" VerticalOptions="Center" Padding="0" Margin="0,10"
+                      x:Name="CustomerRow" IsVisible="True">
+                    <Frame Grid.Column="0" BackgroundColor="#13FFFFFF" CornerRadius="20" Padding="10"
+                           HasShadow="False" VerticalOptions="Center">
+                        <Entry x:Name="CustomerNameEntry"
+                               Placeholder="Enter Customer's Name"
+                               PlaceholderColor="White"
+                               TextColor="White"
+                               BackgroundColor="Transparent"
+                               FontAttributes="Bold"
+                               TextChanged="OnCustomerNameChanged"/>
+                    </Frame>
+
+                    <Button Grid.Column="1"
+                            x:Name="AddCustomerEntry"
+                            BackgroundColor="#5953C6"
+                            WidthRequest="60"
+                            HeightRequest="60"
+                            CornerRadius="15"
+                            ImageSource="addcustomer.png"
+                            Padding="10"
+                            Clicked="OnAddNewCustomerClicked"
+                            HorizontalOptions="Center"
+                            VerticalOptions="Center"/>
+                </Grid>
+
+                <!-- Suggestions -->
+                <CollectionView x:Name="CustomerSuggestions"
+                                SelectionMode="Single"
+                                IsVisible="False"
+                                HeightRequest="100"
+                                SelectionChanged="OnCustomerSelected">
+                    <CollectionView.ItemTemplate>
+                        <DataTemplate>
+                            <Label Text="{Binding FullName}" Padding="10" TextColor="White"/>
+                        </DataTemplate>
+                    </CollectionView.ItemTemplate>
+                </CollectionView>
+
+                <!-- DUE DATE PICKER -->
+                <Frame BackgroundColor="#13FFFFFF" CornerRadius="10" Padding="12">
+                    <DatePicker x:Name="DueDatePicker"
+                                TextColor="White"
+                                BackgroundColor="Transparent"
+                                Format="MMMM dd, yyyy"
+                                MinimumDate="{x:Static sys:DateTime.Now}"/>
+                </Frame>
+
+                <!-- POPUP: Add Customer Form -->
+                <ContentView x:Name="CustomerPopup" IsVisible="False"
+                             BackgroundColor="#80000000"
+                             AbsoluteLayout.LayoutFlags="All"
+                             AbsoluteLayout.LayoutBounds="0,0,1,1">
+                    <Frame BackgroundColor="White"
+                           CornerRadius="20"
+                           Padding="20"
+                           Margin="20"
+                           VerticalOptions="Center"
+                           HorizontalOptions="Center"
+                           WidthRequest="300">
+                        <VerticalStackLayout Spacing="12">
+                            <Entry x:Name="FirstNameEntry" Placeholder="First Name"/>
+                            <Entry x:Name="LastNameEntry" Placeholder="Last Name"/>
+                            <Entry x:Name="ContactNumberEntry" Placeholder="Contact Number" Keyboard="Telephone"/>
+                            <Entry x:Name="AddressEntry" Placeholder="Address"/>
+                            <Button Text="Save Customer" Clicked="OnSaveCustomerClicked"/>
+                            <Button Text="Cancel" BackgroundColor="LightGray" TextColor="Black" Clicked="OnCancelCustomerPopup"/>
+                        </VerticalStackLayout>
+                    </Frame>
+                </ContentView>
+            </StackLayout>
+
+            <!-- FINAL SAVE BUTTON -->
+            <Button Text="Save"
+                    BackgroundColor="#007BFF"
+                    TextColor="White"
+                    CornerRadius="10"
+                    FontAttributes="Bold"
+                    FontSize="18"
+                    Padding="14"
+                    Clicked="OnSaveClicked"/>
+        </VerticalStackLayout>
+    </ScrollView>
+</ContentPage>
