@@ -1,12 +1,11 @@
-from django.contrib import admin # type: ignore
-from django.urls import path, include # type: ignore
+from django.contrib import admin
+from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 
-
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/', include('accounts.urls')),  # ✅ Only use this — no need to repeat individual paths below
+    path('api/', include('accounts.urls')),
 ]
 
 if settings.DEBUG:
