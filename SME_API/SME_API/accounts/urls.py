@@ -17,6 +17,7 @@ urlpatterns = [
     path('customers/', views.customers),
     path('customers/<int:customer_id>/records/', views.customer_record),
     path('customers/<int:customer_id>/remaining_credit/', views.get_remaining_credit),
+    path('customers/<int:customer_id>/debts/', views.customer_debts),
 
     # Products and Sales
     path('add-product-stockin/', views.add_product_with_stockin),

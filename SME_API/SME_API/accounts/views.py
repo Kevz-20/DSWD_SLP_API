@@ -17,6 +17,10 @@ from django.shortcuts import render
 # ✅ Add Product and Stock-In (combined API)
 from django.db import transaction
 from rest_framework.exceptions import ValidationError
+from collections import OrderedDict
+from rest_framework import status as http_status
+
+
 
 
 from decimal import Decimal
@@ -525,10 +529,6 @@ def record_sale(request):
 
 
 
-
-
-
-
 @api_view(['POST'])
 def create_customer(request):
     serializer = CustomerSerializer(data=request.data)
@@ -788,7 +788,91 @@ def revenue_report(request):
     })
 
 
+@api_view(['GET'])
+def customer_debts(request, customer_id: int):
+    """
+    Returns sales grouped with products and sale-level due_date/status.
 
+    status rules (per sale):
+      - paid:    every line is paid (status==1) or amount<=0
+      - unpaid:  every line is unpaid (status==0) and amount>0
+      - partial: a mix of paid and unpaid (or some zero-amounts)
+    due_date rule: the latest non-null due_date among the sale's lines.
+    """
+    # Important: fetch ALL credit lines (both paid and unpaid) to compute sale status correctly
+    qs = (
+        SalesCredit.objects
+        .filter(customer_id=customer_id)
+        .select_related('product', 'sale')
+        .order_by('sale_id', 'id')
+    )
 
+    grouped = OrderedDict()
+
+    for sc in qs:
+        sale_id = sc.sale_id
+
+        # unit price: prefer amount/quantity; fallback to product.selling_price
+        if sc.quantity:
+            unit_price = float(sc.amount or 0) / sc.quantity
+        else:
+            unit_price = float(sc.product.selling_price) if sc.product else 0.0
+
+        product_item = {
+            "product_name": sc.product.product_name if sc.product else "",
+            "quantity": sc.quantity or 0,
+            "selling_price": unit_price,
+        }
+
+        if sale_id not in grouped:
+            grouped[sale_id] = {
+                "sale_id": sale_id,
+                "date": sc.credit_date.isoformat() if sc.credit_date else "",
+                "due_date": "",        # fill after loop
+                "status": "",          # fill after loop
+                "products": [],
+                # temp counters/holders
+                "__paid": 0,
+                "__unpaid": 0,
+                "__due_latest": None,
+            }
+
+        g = grouped[sale_id]
+        g["products"].append(product_item)
+
+        # temp counters for status calculation
+        is_paid_line = (sc.status == 1) or (float(sc.amount or 0) <= 0)
+        if is_paid_line:
+            g["__paid"] += 1
+        else:
+            g["__unpaid"] += 1
+
+        # track the latest due_date among lines
+        if sc.due_date:
+            if g["__due_latest"] is None or sc.due_date > g["__due_latest"]:
+                g["__due_latest"] = sc.due_date
+
+    # finalize per-sale fields
+    result = []
+    for sale in grouped.values():
+        paid, unpaid = sale["__paid"], sale["__unpaid"]
+
+        if unpaid == 0:
+            sale_status = "paid"
+        elif paid == 0:
+            sale_status = "unpaid"
+        else:
+            sale_status = "partial"
+
+        sale["status"] = sale_status
+        sale["due_date"] = sale["__due_latest"].isoformat() if sale["__due_latest"] else ""
+
+        # drop temp keys
+        for k in ("__paid", "__unpaid", "__due_latest"):
+            sale.pop(k, None)
+
+        result.append(sale)
+
+    return Response(result, status=http_status.HTTP_200_OK)
 
 

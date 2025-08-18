@@ -115,4 +115,4 @@ class SalesCredit(models.Model):
     credit_date = models.DateField()
     paid_date = models.DateField(null=True, blank=True)
     or_num = models.CharField(max_length=50)
-    due_date = models.DateField(null=True, blank=True)  # ✅ ADD THIS LINE
+    due_date = models.DateField(null=True, blank=True) 

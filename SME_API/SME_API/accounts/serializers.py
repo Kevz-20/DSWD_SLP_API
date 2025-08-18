@@ -65,10 +65,6 @@ class AddProductStockInSerializer(serializers.Serializer):
         return product
 
 
-
-
-
-
 class SalesCashSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(write_only=True)
     quantity = serializers.IntegerField(write_only=True)
