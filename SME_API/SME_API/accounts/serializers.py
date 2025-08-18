@@ -392,4 +392,13 @@ class AccountNameSerializer(serializers.Serializer):
         middle = '' if obj.middle_name == 'N/A' else f' {obj.middle_name} '
         return f"{obj.first_name}{middle}{obj.last_name}"
     
+# Reset PIN Serializer
+class ResetPinSerializer(serializers.Serializer):
+    phone_number = serializers.CharField(max_length=15)
+    old_pin = serializers.CharField(max_length=4)
+    new_pin = serializers.CharField(max_length=4)
 
+    def validate_new_pin(self, value):
+        if len(value) != 4 or not value.isdigit():
+            raise serializers.ValidationError("PIN must be exactly 4 digits")
+        return value

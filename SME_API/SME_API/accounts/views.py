@@ -4,7 +4,7 @@ from rest_framework.response import Response # type: ignore # ✅ Correct import
 from rest_framework import status # type: ignore # ✅ Correct import
 from django.utils import timezone  # type: ignore # ✅ Correct import
 from .models import Account, CapitalTransaction, Expense, Product, SaleItem, StockIn, SalesCash, Sale ,SalesCredit, Customer, Account
-from .serializers import AccountSerializer,BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer,AccountNameSerializer,ExpenseSerializer, UpdateStockInSerializer
+from .serializers import ResetPinSerializer, AccountSerializer,BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer,AccountNameSerializer,ExpenseSerializer, UpdateStockInSerializer
 from datetime import date, time,datetime
 from rest_framework import viewsets, generics # type: ignore # ✅ Correct import
 from django.db.models import Sum # type: ignore
@@ -14,6 +14,8 @@ from rest_framework.decorators import api_view, parser_classes
 from django.utils.dateparse import parse_date
 from django.http import JsonResponse
 from django.shortcuts import render
+from rest_framework.views import APIView
+from django.shortcuts import get_object_or_404
 # ✅ Add Product and Stock-In (combined API)
 from django.db import transaction
 from rest_framework.exceptions import ValidationError
@@ -89,10 +91,37 @@ class CapitalTransactionListCreateView(generics.ListCreateAPIView):
 
         serializer.save()
 
+# Reset PIN View
+@api_view(['POST'])
+def reset_pin(request):
+    serializer = ResetPinSerializer(data=request.data)
 
-    
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+    data = serializer.validated_data
+    phone_number = data['phone_number']
+    old_pin = data['old_pin']
+    new_pin = data['new_pin']
 
+    try:
+        account = Account.objects.get(phone_number=phone_number)
+    except Account.DoesNotExist:
+        return Response({"error": "Account not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if account.pin != old_pin:
+        return Response({"error": "Old PIN is incorrect"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if len(new_pin) != 4 or not new_pin.isdigit():
+        return Response({"error": "PIN must be exactly 4 digits"}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Update PIN
+    account.pin = new_pin
+    account.save()
+
+    return Response(
+        {"message": "PIN reset successful", "phone_number": account.phone_number},
+        status=status.HTTP_200_OK)
 
 # THIS VIEW FOR STOCK IN PRODUCTS ( STOCK - IN ) ----------------------------------------------------------------------------------------------------------------------------------------
 @api_view(['POST'])

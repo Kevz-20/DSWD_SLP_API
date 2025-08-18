@@ -36,8 +36,6 @@ class Product(models.Model):
         return self.product_name
 
 
-
-
 class Sale(models.Model):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, null=True, blank=True)
     quantity = models.IntegerField(default=1)

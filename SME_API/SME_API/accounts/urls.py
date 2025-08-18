@@ -1,6 +1,6 @@
 from django.urls import path # type: ignore
 from . import views
-from .views import CapitalTransactionListCreateView 
+from .views import CapitalTransactionListCreateView
 from django.urls import path
 
 urlpatterns = [
@@ -11,6 +11,7 @@ urlpatterns = [
     path('accounts/fullname/<str:phone_number>/', views.get_full_name),
     path('accounts/fullname/update/<str:phone_number>/', views.update_full_name),
     path('accounts/update-pin/<str:phone_number>/', views.update_pin),
+    path('reset-pin/', views.reset_pin),
 
     # Customer
     path('customers/create/', views.create_customer),
@@ -31,7 +32,6 @@ urlpatterns = [
     path('stockin/<int:batch_id>/update/', views.edit_stockin_batch, name='edit_stockin_batch'),
     path('batches/', views.get_batches_by_product_name, name='get_batches_by_product_name'),
 
-
     #Capital
     path('capital/', CapitalTransactionListCreateView.as_view(), name='capital-transactions'),
     path('capital/balance/', views.get_current_capital_balance),
@@ -41,6 +41,4 @@ urlpatterns = [
 
     #Financial Report
     path('revenue-report/', views.revenue_report, name='revenue-report'),
-    
-
 ]
