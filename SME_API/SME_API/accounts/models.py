@@ -90,6 +90,7 @@ class Capital(models.Model):
 
 
 class SalesCash(models.Model):
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)  
     sale = models.ForeignKey(Sale, on_delete=models.CASCADE)
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
@@ -106,6 +107,7 @@ class Customer(models.Model):
     
 
 class SalesCredit(models.Model):
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True) 
     sale = models.ForeignKey(Sale, on_delete=models.CASCADE)
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
     customer = models.ForeignKey(Customer, on_delete=models.CASCADE)

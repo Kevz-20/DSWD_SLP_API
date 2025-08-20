@@ -41,6 +41,8 @@ urlpatterns = [
 
     #Financial Report
     path('revenue-report/', views.revenue_report, name='revenue-report'),
-    
+
+    #Expense Report
+    path('expenses/summary/', views.expenses_summary),
 
 ]

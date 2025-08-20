@@ -17,6 +17,8 @@ from django.shortcuts import render
 # ✅ Add Product and Stock-In (combined API)
 from django.db import transaction
 from rest_framework.exceptions import ValidationError
+from django.db.models import F, Sum, DecimalField, ExpressionWrapper
+from decimal import Decimal, ROUND_HALF_UP
 
 
 from decimal import Decimal
@@ -353,174 +355,202 @@ from .models import (
     Customer
 )
 
-# THIS VIEW FOR RECORDING SALES ( RECORD SALES ) -----------------------------------------------------------------------------------------------------------------------------------------
+# THIS VIEW FOR RECORDING SALES ( RECORD SALES ) ----------------------------------------------------------------------------------------------------------------------------------------
+
 @api_view(['POST'])
 def record_sale(request):
-    sale_type = request.data.get('sale_type', 'cash').lower()
+    sale_type = (request.data.get('sale_type') or 'cash').lower()
     account_id = request.data.get('account_id')
     or_num = request.data.get('or_num') or f"OR{int(time.time())}"
-    products_data = request.data.get('products')
+    products_data = request.data.get('products') or []
     customer_data = request.data.get('customer_data')
     today = timezone.now().date()
-    due_date_str = customer_data.get("due_date") if customer_data else None
 
+    # --- Validate account_id ---
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        return Response({'error': 'account_id is required and must be an integer'}, status=400)
 
+    # --- Validate products payload ---
+    if not isinstance(products_data, list) or len(products_data) == 0:
+        return Response({'error': 'products must be a non-empty list'}, status=400)
+
+    # --- Parse due_date (utang only) ---
     due_date = None
-    if due_date_str:
-        try:
-         due_date = datetime.strptime(due_date_str, "%Y-%m-%d").date()
-        except ValueError:
-         return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=400)
-
-
-
-    # ✅ Step 1: Load or create customer if UTANG
-    customer = None
     if sale_type == 'utang':
-        if not customer_data:
-            return Response({'error': 'Customer data required for utang sale'}, status=400)
-
-        customer_id = customer_data.get('id')
-        if customer_id:
+        due_date_str = (customer_data or {}).get('due_date')
+        if due_date_str:
             try:
-                customer = Customer.objects.get(id=customer_id)
-            except Customer.DoesNotExist:
-                return Response({'error': 'Customer not found with given ID'}, status=400)
-        else:
-            first_name = customer_data.get('first_name', '').strip()
-            last_name = customer_data.get('last_name', '').strip()
-            contact_num = customer_data.get('contact_num', '').strip()
+                due_date = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                return Response({'error': 'Invalid due_date format. Use YYYY-MM-DD.'}, status=400)
 
-            if not contact_num:
-                return Response({'error': 'Contact number is required for new customers'}, status=400)
+    # Start atomic transaction
+    with transaction.atomic():
+        # Step 1: Load/create customer if UTANG
+        customer = None
+        if sale_type == 'utang':
+            if not customer_data:
+                return Response({'error': 'customer_data required for utang sale'}, status=400)
 
-            customer = Customer.objects.filter(contact_num__iexact=contact_num).first()
+            customer_id = customer_data.get('id')
+            if customer_id:
+                try:
+                    customer = Customer.objects.get(id=customer_id)
+                except Customer.DoesNotExist:
+                    return Response({'error': 'Customer not found with given ID'}, status=400)
+            else:
+                first_name = (customer_data.get('first_name') or '').strip() or 'Unknown'
+                last_name = (customer_data.get('last_name') or '').strip() or 'Unknown'
+                contact_num = (customer_data.get('contact_num') or '').strip()
+                address = (customer_data.get('address') or '').strip()
 
+                if not contact_num:
+                    return Response({'error': 'contact_num is required to create a new customer'}, status=400)
 
-            if not customer:
-                customer = Customer.objects.create(
-                    first_name=first_name or 'Unknown',
-                    last_name=last_name or 'Unknown',
-                    address=customer_data.get('address', '').strip(),
-                    contact_num=contact_num
-                )
+                customer = Customer.objects.filter(contact_num__iexact=contact_num).first()
+                if not customer:
+                    customer = Customer.objects.create(
+                        first_name=first_name,
+                        last_name=last_name,
+                        address=address,
+                        contact_num=contact_num
+                    )
 
-    # ✅ Step 2: Pre-check all products and calculate total cost
-    total_cost = Decimal("0.00")
-    product_objs = []
+        # Step 2: Pre-check products and stock (build list of tuples for later)
+        product_objs = []  # list of (product, quantity, [stock_batches])
+        for item in products_data:
+            # Prefer ID, fallback to name
+            product_obj = None
+            product_id = item.get('product_id')
+            product_name = item.get('product_name')
 
-    for item in products_data:
-        product_name = item.get('product_name')
-        quantity = int(item.get('quantity', 0))
+            if product_id:
+                try:
+                    product_obj = Product.objects.get(id=product_id)
+                except Product.DoesNotExist:
+                    return Response({'error': f'Product ID {product_id} not found'}, status=400)
+            else:
+                if not product_name:
+                    return Response({'error': 'Each product needs product_id or product_name'}, status=400)
+                try:
+                    product_obj = Product.objects.get(product_name=product_name)
+                except Product.DoesNotExist:
+                    return Response({'error': f'Product {product_name} not found'}, status=400)
 
-        try:
-            product = Product.objects.get(product_name=product_name)
-        except Product.DoesNotExist:
-            return Response({'error': f'Product {product_name} not found'}, status=400)
+            try:
+                quantity = int(item.get('quantity', 0))
+            except (TypeError, ValueError):
+                return Response({'error': f'Invalid quantity for product {product_obj.product_name}'}, status=400)
 
-        # FIFO: Check stock availability from StockIn batches
-        stock_batches = StockIn.objects.filter(product=product, remaining_quantity__gt=0).order_by('created_at')
-        total_available = sum(batch.remaining_quantity for batch in stock_batches)
+            if quantity <= 0:
+                return Response({'error': f'Quantity must be > 0 for {product_obj.product_name}'}, status=400)
 
-        if total_available < quantity:
-            return Response({'error': f'Insufficient stock for {product_name}'}, status=400)
+            # FIFO batches with stock
+            stock_batches = StockIn.objects.filter(
+                product=product_obj, remaining_quantity__gt=0
+            ).order_by('created_at')
 
-        product_objs.append((product, quantity, stock_batches))
+            total_available = sum(b.remaining_quantity for b in stock_batches)
+            if total_available < quantity:
+                return Response({'error': f'Insufficient stock for {product_obj.product_name}'}, status=400)
 
-    # ✅ Step 3: If UTANG, calculate total cost based on FIFO prices
-    if sale_type == 'utang':
-        simulated_total = Decimal("0.00")
-        for product, quantity, batches in product_objs:
-            q = quantity
-            for batch in batches:
+            product_objs.append((product_obj, quantity, stock_batches))
+
+        # Step 3: For UTANG, simulate total charge vs credit limit
+        if sale_type == 'utang':
+            simulated_total = Decimal('0.00')
+            for product, qty, batches in product_objs:
+                q = qty
+                for batch in batches:
+                    if q == 0:
+                        break
+                    deduct = min(q, batch.remaining_quantity)
+                    selling = Decimal(batch.purchase_price) * (Decimal('1') + (Decimal(str(batch.markup_rate)) / Decimal('100')))
+                    simulated_total += (selling * deduct)
+                    q -= deduct
+
+            if customer.credit_limit < simulated_total:
+                return Response({
+                    'error': f"Insufficient credit. Remaining: ₱{customer.credit_limit:,.2f}, Required: ₱{simulated_total:,.2f}"
+                }, status=400)
+
+        # Step 4: Create sales, deduct stock FIFO, and create SalesCash / SalesCredit rows
+        for product, qty, stock_batches in product_objs:
+            sale = Sale.objects.create(
+                product=product,
+                quantity=qty,
+                selling_price=Decimal('0.00'),  # not used with batching
+                sale_type=sale_type,
+                customer=customer if sale_type == 'utang' else None
+            )
+
+            q = qty
+            for batch in stock_batches:
                 if q == 0:
                     break
                 deduct = min(q, batch.remaining_quantity)
-                unit_price = Decimal(batch.purchase_price) + (Decimal(batch.purchase_price) * Decimal(batch.markup_rate) / 100)
-                simulated_total += unit_price * deduct
+
+                # Selling price per unit from batch
+                selling_unit = Decimal(batch.purchase_price) * (Decimal('1') + (Decimal(str(batch.markup_rate)) / Decimal('100')))
+                line_total = (selling_unit * Decimal(deduct))
+
+                SaleItem.objects.create(
+                    sale=sale,
+                    stockin=batch,
+                    quantity=deduct,
+                    unit_price=selling_unit
+                )
+
+                batch.remaining_quantity -= deduct
+                batch.save(update_fields=['remaining_quantity'])
+
+                if sale_type == 'utang':
+                    SalesCredit.objects.create(
+                        account_id=account_id,
+                        sale=sale,
+                        product=product,
+                        customer=customer,
+                        amount=line_total,
+                        quantity=deduct,
+                        status=0,  # unpaid
+                        credit_date=today,
+                        paid_date=None,
+                        or_num=or_num,
+                        due_date=due_date
+                    )
+                else:
+                    SalesCash.objects.create(
+                        account_id=account_id,
+                        sale=sale,
+                        product=product,
+                        amount=line_total,
+                        quantity=deduct,
+                        date=today,
+                        or_num=or_num
+                    )
+                    # Record capital inflow for cash
+                    CapitalTransaction.objects.create(
+                        amount=line_total,
+                        transaction_type='deposit',
+                        remarks=f"Cash Sale: {product.product_name}"
+                    )
+
                 q -= deduct
 
-        if customer.credit_limit < simulated_total:
-            return Response({
-                'error': f"Insufficient credit. Remaining: ₱{customer.credit_limit:,.2f}, Required: ₱{simulated_total:,.2f}"
-            }, status=400)
-
-    # ✅ Step 4: Create Sale and deduct stock from FIFO batches
-    for product, quantity, stock_batches in product_objs:
-        sale = Sale.objects.create(
-            product=product,
-            quantity=quantity,
-            selling_price=0,  # Not used when batching
-            sale_type=sale_type,
-            customer=customer if sale_type == 'utang' else None
-        )
-
-        q = quantity
-        for batch in stock_batches:
-            if q == 0:
-                break
-            deduct = min(q, batch.remaining_quantity)
-            unit_price = Decimal(batch.purchase_price) + (Decimal(batch.purchase_price) * Decimal(batch.markup_rate) / 100)
-
-            # 📆 Save SaleItem
-            SaleItem.objects.create(
-                sale=sale,
-                stockin=batch,
-                quantity=deduct,
-                unit_price=unit_price
-
-            )
-
-            batch.remaining_quantity -= deduct
-            batch.save()
-
-            total = unit_price * deduct
-
-
-
-            if sale_type == 'utang':
-
-                SalesCredit.objects.create(
-                    sale=sale,
-                    product=product,
-                    customer=customer,
-                    due_date=due_date, # type: ignore
-                    amount=total,
-                    quantity=deduct,
-                    status=0,
-                    credit_date=today,
-                    or_num=or_num,
-                )
-            else:
-                SalesCash.objects.create(
-                    sale=sale,
-                    product=product,
-                    amount=total,
-                    quantity=deduct,
-                    date=today,
-                    or_num=or_num
-                )
-
-                CapitalTransaction.objects.create(
-                    amount=total,
-                    transaction_type='deposit',
-                    remarks=f"Cash Sale: {product.product_name}"
-                )
-
-            q -= deduct
-
-    # ✅ Step 5: Deduct total cost from credit limit
-    if sale_type == 'utang':
-    # Recalculate unpaid credit after sale
-        total_utang = SalesCredit.objects.filter(customer=customer, status=0).aggregate(total=Sum('amount'))['total'] or 0
-        remaining_credit = float(customer.credit_limit - total_utang)
-    else:
+        # Step 5: compute remaining credit (utang only)
         remaining_credit = None
+        if sale_type == 'utang':
+            total_utang = SalesCredit.objects.filter(customer=customer, status=0)\
+                           .aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+            remaining_credit = float(customer.credit_limit - total_utang)
 
     return Response({
         'message': 'All sales recorded successfully',
         'remaining_credit': remaining_credit
     }, status=201)
+
 
 
 
@@ -760,32 +790,134 @@ def update_pin(request, phone_number):
     except Account.DoesNotExist:
         return Response({"error": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
     
+# THIS VIEW FOR REVENUE  REPORTS ------------------------------------------------------------------------------------------------------------------------------------
 
+@api_view(['GET'])
 def revenue_report(request):
     start_date = parse_date(request.GET.get('start_date'))
-    end_date = parse_date(request.GET.get('end_date'))
+    end_date   = parse_date(request.GET.get('end_date'))
+    account_id = request.GET.get('account_id')  # optional
+
+    if not start_date or not end_date or end_date < start_date:
+        return Response({'error': 'Valid start_date and end_date are required.'}, status=400)
+
+    date_range = (start_date, end_date)
+
+    # Revenue components
+    cash_qs   = SalesCash.objects.filter(date__range=date_range)
+    paid_qs   = SalesCredit.objects.filter(status=1, paid_date__isnull=False, paid_date__range=date_range)
+    unpaid_qs = SalesCredit.objects.filter(status=0, credit_date__range=date_range)
+
+    if account_id:
+        cash_qs   = cash_qs.filter(account_id=account_id)
+        paid_qs   = paid_qs.filter(account_id=account_id)
+        unpaid_qs = unpaid_qs.filter(account_id=account_id)
+
+    cash_sales_total    = cash_qs.aggregate(total=Sum('amount'))['total'] or 0
+    paid_credit_total   = paid_qs.aggregate(total=Sum('amount'))['total'] or 0
+    unpaid_credit_total = unpaid_qs.aggregate(total=Sum('amount'))['total'] or 0
+
+    total_revenue = (cash_sales_total or 0) + (paid_credit_total or 0)
+
+    # --- COGS (match the revenue you recognized) ---
+    # COGS for cash sales within range + credit sales that were PAID within range
+    cash_sale_ids = cash_qs.values_list('sale_id', flat=True)
+    paid_sale_ids = paid_qs.values_list('sale_id', flat=True)
+
+    cogs_items = SaleItem.objects.filter(sale_id__in=list(cash_sale_ids) + list(paid_sale_ids))
+    cogs = cogs_items.annotate(
+        line_cogs=ExpressionWrapper(
+            F('quantity') * F('stockin__purchase_price'),
+            output_field=DecimalField(max_digits=12, decimal_places=2)
+        )
+    ).aggregate(total=Sum('line_cogs'))['total'] or 0
+
+    # --- Expenses within range ---
+    expenses_qs = Expense.objects.filter(created_at__date__range=date_range)
+    if account_id:
+        expenses_qs = expenses_qs.filter(account_id=account_id)
+    expenses_total = expenses_qs.aggregate(total=Sum('amount'))['total'] or 0
+
+    # --- Profits ---
+    gross_profit = (total_revenue or 0) - (cogs or 0)
+    net_profit   = gross_profit - (expenses_total or 0)
+
+    return Response({
+        # keep existing fields for compatibility
+        'cash_sales':           round(float(cash_sales_total), 2),
+        'paid_credit_sales':    round(float(paid_credit_total), 2),
+        'unpaid_credit_sales':  round(float(unpaid_credit_total), 2),
+        'total_revenue':        round(float(total_revenue), 2),
+
+        # new fields used by your MAUI page
+        'cost_of_goods':        round(float(cogs), 2),
+        'gross_profit':         round(float(gross_profit), 2),
+        'expenses':             round(float(expenses_total), 2),
+        'net_profit':           round(float(net_profit), 2),
+    })
+
+
+# --- EXPENSES SUMMARY (for Income Statement PDF) ------------------------------
+@api_view(['GET'])
+def expenses_summary(request):
+    """
+    Returns expenses grouped by category within a date range.
+    Query params:
+      - start_date (YYYY-MM-DD)  [required]
+      - end_date   (YYYY-MM-DD)  [required]
+      - account_id               [optional]
+    Response:
+    {
+      "items": [
+        {"name": "Transportation", "amount": "150.00"},
+        {"name": "Deleted Product", "amount": "75.50"}
+      ]
+    }
+    """
+    start_date = request.GET.get('start_date')
+    end_date   = request.GET.get('end_date')
+    account_id = request.GET.get('account_id')
 
     if not start_date or not end_date:
-        return JsonResponse({'error': 'Start date and end date are required.'}, status=400)
+        return Response(
+            {'error': 'start_date and end_date are required (YYYY-MM-DD).'},
+            status=400
+        )
 
-    # Get total from SalesCash within date range
-    cash_sales_total = SalesCash.objects.filter(
-        date__range=[start_date, end_date]
-    ).aggregate(total=Sum('amount'))['total'] or 0
+    # base queryset
+    qs = Expense.objects.all().order_by('category')
 
-    # Get total from paid SalesCredit within date range
-    credit_sales_total = SalesCredit.objects.filter(
-        credit_date__range=[start_date, end_date],
-        status=1  # Only include fully paid credits
-    ).aggregate(total=Sum('amount'))['total'] or 0
+    # optional account filter
+    if account_id:
+        qs = qs.filter(account_id=account_id)
 
-    total_revenue = cash_sales_total + credit_sales_total
+    # date filter on created_at's DATE part
+    try:
+        start = parse_date(start_date)
+        end   = parse_date(end_date)
+        if not start or not end or end < start:
+            raise ValueError
+        qs = qs.filter(created_at__date__gte=start, created_at__date__lte=end)
+    except Exception:
+        return Response({'error': 'Invalid date range.'}, status=400)
 
-    return JsonResponse({
-        'cash_sales': round(cash_sales_total, 2),
-        'paid_credit_sales': round(credit_sales_total, 2),
-        'total_revenue': round(total_revenue, 2)
-    })
+    # group by category and sum
+    rows = qs.values('category').annotate(amount=Sum('amount')).order_by('category')
+
+    # format output with 2 decimal places
+    items = [
+        {
+            'name': r['category'],
+            'amount': str(
+                Decimal(r['amount'] or 0).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            )
+        }
+        for r in rows
+    ]
+
+    return Response({'items': items})
+
+
 
 
 
