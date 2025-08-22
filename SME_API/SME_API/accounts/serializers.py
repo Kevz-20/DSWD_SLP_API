@@ -372,11 +372,6 @@ class CreditTransactionSerializer(serializers.Serializer):
     credit_date = serializers.DateField()
     items = CreditItemSerializer(many=True)
 
-
-
-
-
-
 class AccountNameSerializer(serializers.Serializer):
     first_name = serializers.CharField()
     middle_name = serializers.CharField()

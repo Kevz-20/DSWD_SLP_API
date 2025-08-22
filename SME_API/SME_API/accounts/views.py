@@ -875,4 +875,56 @@ def customer_debts(request, customer_id: int):
 
     return Response(result, status=http_status.HTTP_200_OK)
 
+# Inside the 'apply_customer_payment' view:
+@api_view(['POST'])
+def apply_customer_payment(request, customer_id: int):
+    """
+    Applies a payment to a customer's outstanding SalesCredit.
+    The deduction is done only for the remaining total, and individual product prices are not affected.
+    """
+    try:
+        amt = Decimal(str(request.data.get('amount', 0)))
+    except Exception:
+        return Response({'error': 'Invalid amount'}, status=400)
 
+    if amt <= 0:
+        return Response({'error': 'Amount must be > 0'}, status=400)
+
+    # Fetch all unpaid SalesCredit lines for this customer
+    qs = (
+        SalesCredit.objects
+        .filter(customer_id=customer_id, amount__gt=0)
+        .order_by('due_date', 'credit_date', 'id')  # FIFO: earliest due date first
+    )
+
+    remaining_amt = amt  # Amount to apply to the debts
+    allocations = []
+
+    for sc in qs:
+        if remaining_amt <= 0:
+            break
+
+        line_remaining = Decimal(sc.amount)
+        applied = min(line_remaining, remaining_amt)
+
+        # Update the remaining amount of the debt (but do not change product prices)
+        sc.amount = line_remaining - applied
+        if sc.amount <= 0:
+            sc.status = 'paid'  # mark as paid
+        sc.save(update_fields=['amount', 'status'])
+
+        allocations.append({
+            'sale_id': sc.sale_id,
+            'applied': float(applied),
+            'remaining': float(sc.amount),
+            'due_date': sc.due_date.isoformat() if sc.due_date else ''
+        })
+
+        remaining_amt -= applied
+
+    # Return the payment allocations without altering product prices
+    return Response({
+        'allocations': allocations,
+        'applied_total': amt - remaining_amt,
+        'unapplied_balance': remaining_amt
+    }, status=200)
