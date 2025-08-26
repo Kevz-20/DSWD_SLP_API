@@ -1,7 +1,7 @@
 from django.urls import path # type: ignore
 from . import views
 from .views import CapitalTransactionListCreateView 
-from django.urls import path
+from django.urls import path # type: ignore
 
 urlpatterns = [
     # Account
@@ -9,7 +9,7 @@ urlpatterns = [
     path('accounts/login/', views.login),
     path('accounts/<str:phone_number>/', views.get_account),
     path('accounts/fullname/<str:phone_number>/', views.get_full_name),
-    path('accounts/fullname/update/<str:phone_number>/', views.update_full_name),
+    path('accounts/fullname/update-secure/<str:phone_number>/', views.update_full_name_secure, name='update_full_name_secure'),
     path('accounts/update-pin/<str:phone_number>/', views.update_pin),
 
     # Customer
@@ -17,6 +17,8 @@ urlpatterns = [
     path('customers/', views.customers),
     path('customers/<int:customer_id>/records/', views.customer_record),
     path('customers/<int:customer_id>/remaining_credit/', views.get_remaining_credit),
+    path('customers/<int:customer_id>/debts/', views.customer_debts), # jesel update
+    path('customers/<int:customer_id>/apply-payment/', views.apply_customer_payment), # jesel update
 
     # Products and Sales
     path('add-product-stockin/', views.add_product_with_stockin),
@@ -41,6 +43,9 @@ urlpatterns = [
 
     #Financial Report
     path('revenue-report/', views.revenue_report, name='revenue-report'),
+
+    #Transaction History
+    path("transactions/", views.transactions_list, name="transactions_list"),
 
     #Expense Report
     path('expenses/summary/', views.expenses_summary),

@@ -1,28 +1,26 @@
+from collections import OrderedDict
 import uuid
-from rest_framework.decorators import api_view # type: ignore # ✅ Correct import
 from rest_framework.response import Response # type: ignore # ✅ Correct import
 from rest_framework import status # type: ignore # ✅ Correct import
 from django.utils import timezone  # type: ignore # ✅ Correct import
 from .models import Account, CapitalTransaction, Expense, Product, SaleItem, StockIn, SalesCash, Sale ,SalesCredit, Customer, Account
 from .serializers import AccountSerializer,BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer,AccountNameSerializer,ExpenseSerializer, UpdateStockInSerializer
-from datetime import date, time,datetime
+from datetime import date, time,datetime, time as dt_time, date as dt_date
 from rest_framework import viewsets, generics # type: ignore # ✅ Correct import
 from django.db.models import Sum # type: ignore
 from . import serializers
-from rest_framework.parsers import MultiPartParser, FormParser
-from rest_framework.decorators import api_view, parser_classes
-from django.utils.dateparse import parse_date
-from django.http import JsonResponse
-from django.shortcuts import render
+from rest_framework.parsers import MultiPartParser, FormParser  # type: ignore
+from rest_framework.decorators import api_view, parser_classes # type: ignore
+from django.utils.dateparse import parse_date # type: ignore
+from django.http import JsonResponse # type: ignore
+from django.shortcuts import render # type: ignore
 # ✅ Add Product and Stock-In (combined API)
-from django.db import transaction
-from rest_framework.exceptions import ValidationError
-from django.db.models import F, Sum, DecimalField, ExpressionWrapper
+from django.db import transaction # type: ignore
+from rest_framework.exceptions import ValidationError # type: ignore
+from django.db.models import F, Sum, DecimalField, ExpressionWrapper # type: ignore
 from decimal import Decimal, ROUND_HALF_UP
-
-
-from decimal import Decimal
-
+import time as pytime  # only if you use time.time() elsewhere (e.g., OR numbers)
+import time
 
 # THIS VIEW FOR CREATING ACCOUNT PAGE ( CREATE ACCOUNT ) -----------------------------------------------------------------------------------------------------------------------------
 @api_view(['POST'])
@@ -71,7 +69,7 @@ def get_current_capital_balance(request):
 
 
 
-# ADD CAPITAL
+# ADD CAPITAL ( CAPITAL MANAGEMENT ) --------------------------------------------------------------------------------------------------------------------------------------------------
 class CapitalTransactionListCreateView(generics.ListCreateAPIView):
     queryset = CapitalTransaction.objects.all().order_by('-date')
     serializer_class = CapitalTransactionSerializer
@@ -92,10 +90,6 @@ class CapitalTransactionListCreateView(generics.ListCreateAPIView):
         serializer.save()
 
 
-    
-
-
-
 # THIS VIEW FOR STOCK IN PRODUCTS ( STOCK - IN ) ----------------------------------------------------------------------------------------------------------------------------------------
 @api_view(['POST'])
 @parser_classes([MultiPartParser, FormParser])  # 👈 Required for image upload
@@ -103,7 +97,15 @@ def add_product_with_stockin(request):
     print("FILES received:", request.FILES)
     print("Image:", request.FILES.get('image'))
 
-    serializer = AddProductStockInSerializer(data=request.data)
+    # ✅ make sure we have the account_id, pass it to the serializer context
+    account_id = request.data.get('account_id')
+    if not account_id:
+        return Response({"error": "account_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    serializer = AddProductStockInSerializer(
+        data=request.data,
+        context={'account_id': account_id}  # 👈 important
+    )
 
     if serializer.is_valid():
         try:
@@ -132,7 +134,7 @@ def add_product_with_stockin(request):
                 if total_cost > balance:
                     raise ValidationError("❌ Not enough capital to stock this product.")
 
-                # ✅ Deduct from capital
+                # ✅ Deduct from capital (this is separate from Expense; your post_save signal writes the Expense)
                 CapitalTransaction.objects.create(
                     amount=total_cost,
                     transaction_type='withdraw',
@@ -147,8 +149,7 @@ def add_product_with_stockin(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-
-
+# THIS VIEW FOR INVENTORTY LIST ( MANAGE INVENTORY PAGE ) ----------------------------------------------------------------------------------------------------------------------------
 @api_view(['GET'])
 def inventory_list(request):
     stockins = StockIn.objects.select_related('product').all()
@@ -340,11 +341,7 @@ def list_expenses(request):
 
 # FOR RECORD SALE PAGE
 
-from rest_framework.decorators import api_view
-from rest_framework.response import Response
-from django.utils import timezone
-from decimal import Decimal
-import time
+
 
 from .models import (
     Product,
@@ -364,7 +361,7 @@ def record_sale(request):
     or_num = request.data.get('or_num') or f"OR{int(time.time())}"
     products_data = request.data.get('products') or []
     customer_data = request.data.get('customer_data')
-    today = timezone.now().date()
+    today = date.today()
 
     # --- Validate account_id ---
     try:
@@ -742,32 +739,6 @@ def get_full_name(request, phone_number):
         return Response({"error": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
 
 
-# THIS VIEW FOR UPDATING FULL NAME (SETTINGS) -------------------------------------------------------------------------------------------------------------------
-@api_view(['PUT'])
-def update_full_name(request, phone_number):
-    try:
-        account = Account.objects.get(phone_number=phone_number)
-    except Account.DoesNotExist:
-        return Response({"error": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
-
-    # Expecting JSON body with full_name string, e.g. "Maria Santos"
-    full_name = request.data.get("full_name")
-    if not full_name:
-        return Response({"error": "Full name is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-    # Assuming full name has first, middle, last separated by spaces
-    parts = full_name.strip().split()
-    if len(parts) < 2:
-        return Response({"error": "Please enter at least first and last name."}, status=status.HTTP_400_BAD_REQUEST)
-
-    # Simple split: first, optional middle(s), last
-    account.first_name = parts[0]
-    account.last_name = parts[-1]
-    account.middle_name = " ".join(parts[1:-1]) if len(parts) > 2 else ""
-
-    account.save()
-    return Response({"message": "Full name updated successfully."}, status=status.HTTP_200_OK)
-
 
 
 # THIS VIEW FOR UPDATING THE PIN -------------------------------------------------------------------------------------------------------------------
@@ -796,127 +767,459 @@ def update_pin(request, phone_number):
 def revenue_report(request):
     start_date = parse_date(request.GET.get('start_date'))
     end_date   = parse_date(request.GET.get('end_date'))
-    account_id = request.GET.get('account_id')  # optional
+    account_id = request.GET.get('account_id')
 
     if not start_date or not end_date or end_date < start_date:
         return Response({'error': 'Valid start_date and end_date are required.'}, status=400)
 
-    date_range = (start_date, end_date)
-
-    # Revenue components
-    cash_qs   = SalesCash.objects.filter(date__range=date_range)
-    paid_qs   = SalesCredit.objects.filter(status=1, paid_date__isnull=False, paid_date__range=date_range)
-    unpaid_qs = SalesCredit.objects.filter(status=0, credit_date__range=date_range)
-
+    # CASH sales (DateField) – OK to use __range on date
+    cash_qs = SalesCash.objects.filter(date__range=(start_date, end_date))
     if account_id:
-        cash_qs   = cash_qs.filter(account_id=account_id)
+        cash_qs = cash_qs.filter(account_id=account_id)
+    cash_sales_total = cash_qs.aggregate(total=Sum('amount'))['total'] or 0
+
+    # CREDIT sales recognized on credit_date (DateField) – OK
+    credit_qs = SalesCredit.objects.filter(credit_date__range=(start_date, end_date))
+    if account_id:
+        credit_qs = credit_qs.filter(account_id=account_id)
+    credit_sales_total = credit_qs.aggregate(total=Sum('amount'))['total'] or 0
+
+    # Collections / unpaid breakdowns (DateFields) – OK
+    paid_qs = SalesCredit.objects.filter(status=1, paid_date__isnull=False,
+                                         paid_date__range=(start_date, end_date))
+    unpaid_qs = SalesCredit.objects.filter(status=0, credit_date__range=(start_date, end_date))
+    if account_id:
         paid_qs   = paid_qs.filter(account_id=account_id)
         unpaid_qs = unpaid_qs.filter(account_id=account_id)
 
-    cash_sales_total    = cash_qs.aggregate(total=Sum('amount'))['total'] or 0
     paid_credit_total   = paid_qs.aggregate(total=Sum('amount'))['total'] or 0
     unpaid_credit_total = unpaid_qs.aggregate(total=Sum('amount'))['total'] or 0
 
-    total_revenue = (cash_sales_total or 0) + (paid_credit_total or 0)
+    # EXPENSES (DateTimeField) – use Manila-local window
+    def local_bounds(d):
+    # Naïve datetimes in local time because USE_TZ = False
+        start_local = datetime.combine(d, dt_time.min)
+        end_local   = datetime.combine(d, dt_time.max)
+        return start_local, end_local
 
-    # --- COGS (match the revenue you recognized) ---
-    # COGS for cash sales within range + credit sales that were PAID within range
-    cash_sale_ids = cash_qs.values_list('sale_id', flat=True)
-    paid_sale_ids = paid_qs.values_list('sale_id', flat=True)
+    start_dt_local, _ = local_bounds(start_date)
+    _, end_dt_local   = local_bounds(end_date)
 
-    cogs_items = SaleItem.objects.filter(sale_id__in=list(cash_sale_ids) + list(paid_sale_ids))
-    cogs = cogs_items.annotate(
-        line_cogs=ExpressionWrapper(
-            F('quantity') * F('stockin__purchase_price'),
-            output_field=DecimalField(max_digits=12, decimal_places=2)
-        )
-    ).aggregate(total=Sum('line_cogs'))['total'] or 0
 
-    # --- Expenses within range ---
-    expenses_qs = Expense.objects.filter(created_at__date__range=date_range)
+    expenses_qs = Expense.objects.all()
     if account_id:
         expenses_qs = expenses_qs.filter(account_id=account_id)
+    expenses_qs = expenses_qs.filter(created_at__gte=start_dt_local,
+                                     created_at__lte=end_dt_local)
     expenses_total = expenses_qs.aggregate(total=Sum('amount'))['total'] or 0
 
-    # --- Profits ---
-    gross_profit = (total_revenue or 0) - (cogs or 0)
+    total_revenue = (cash_sales_total or 0) + (credit_sales_total or 0)
+    cogs = 0
+    gross_profit = total_revenue - cogs
     net_profit   = gross_profit - (expenses_total or 0)
 
     return Response({
-        # keep existing fields for compatibility
         'cash_sales':           round(float(cash_sales_total), 2),
+        'credit_sales':         round(float(credit_sales_total), 2),
         'paid_credit_sales':    round(float(paid_credit_total), 2),
         'unpaid_credit_sales':  round(float(unpaid_credit_total), 2),
         'total_revenue':        round(float(total_revenue), 2),
-
-        # new fields used by your MAUI page
-        'cost_of_goods':        round(float(cogs), 2),
+        'cost_of_goods':        float(cogs),
         'gross_profit':         round(float(gross_profit), 2),
         'expenses':             round(float(expenses_total), 2),
         'net_profit':           round(float(net_profit), 2),
     })
 
 
+
+
 # --- EXPENSES SUMMARY (for Income Statement PDF) ------------------------------
 @api_view(['GET'])
 def expenses_summary(request):
-    """
-    Returns expenses grouped by category within a date range.
-    Query params:
-      - start_date (YYYY-MM-DD)  [required]
-      - end_date   (YYYY-MM-DD)  [required]
-      - account_id               [optional]
-    Response:
-    {
-      "items": [
-        {"name": "Transportation", "amount": "150.00"},
-        {"name": "Deleted Product", "amount": "75.50"}
-      ]
-    }
-    """
     start_date = request.GET.get('start_date')
     end_date   = request.GET.get('end_date')
     account_id = request.GET.get('account_id')
 
     if not start_date or not end_date:
-        return Response(
-            {'error': 'start_date and end_date are required (YYYY-MM-DD).'},
-            status=400
-        )
+        return Response({'error': 'start_date and end_date are required (YYYY-MM-DD).'}, status=400)
 
-    # base queryset
-    qs = Expense.objects.all().order_by('category')
+    start = parse_date(start_date)
+    end   = parse_date(end_date)
+    if not start or not end or end < start:
+        return Response({'error': 'Invalid date range.'}, status=400)
 
-    # optional account filter
+    def local_bounds(d):
+    # Naïve datetimes in local time because USE_TZ = False
+        start_local = datetime.combine(d, dt_time.min)
+        end_local   = datetime.combine(d, dt_time.max)
+        return start_local, end_local
+
+
+    start_dt_local, _ = local_bounds(start)
+    _, end_dt_local   = local_bounds(end)
+
+    qs = Expense.objects.all()
     if account_id:
         qs = qs.filter(account_id=account_id)
 
-    # date filter on created_at's DATE part
-    try:
-        start = parse_date(start_date)
-        end   = parse_date(end_date)
-        if not start or not end or end < start:
-            raise ValueError
-        qs = qs.filter(created_at__date__gte=start, created_at__date__lte=end)
-    except Exception:
-        return Response({'error': 'Invalid date range.'}, status=400)
+    qs = qs.filter(created_at__gte=start_dt_local,
+                   created_at__lte=end_dt_local)
 
-    # group by category and sum
     rows = qs.values('category').annotate(amount=Sum('amount')).order_by('category')
 
-    # format output with 2 decimal places
-    items = [
-        {
-            'name': r['category'],
-            'amount': str(
-                Decimal(r['amount'] or 0).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-            )
-        }
-        for r in rows
-    ]
+    items = [{
+        'name': r['category'],
+        'amount': str(Decimal(r['amount'] or 0).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+    } for r in rows]
 
     return Response({'items': items})
 
+
+# NEW: secure full-name update that requires a valid PIN
+@api_view(['PUT'])
+def update_full_name_secure(request, phone_number):
+    try:
+        account = Account.objects.get(phone_number=phone_number)
+    except Account.DoesNotExist:
+        return Response({"error": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    pin    = (request.data.get("pin") or "").strip()
+    first  = (request.data.get("first_name") or "").strip()
+    middle = (request.data.get("middle_name") or "").strip()
+    last   = (request.data.get("last_name") or "").strip()
+
+    if not pin:
+        return Response({"error": "PIN is required."}, status=400)
+    if account.pin != pin:
+        return Response({"error": "Invalid PIN."}, status=403)
+
+    if not first or not last:
+        return Response({"error": "First and last name are required."}, status=400)
+
+    account.first_name  = first
+    account.middle_name = middle  # may be ""
+    account.last_name   = last
+    account.save()
+
+    return Response({"message": "Full name updated.",
+                     "full_name": account.full_name}, status=200)
+
+
+
+
+
+@api_view(['GET'])
+def transactions_list(request):
+    """
+    GET /api/transactions/?account=12&start=YYYY-MM-DD&end=YYYY-MM-DD&filter=all|sales|expenses
+    Newest-first across Expenses, Cash Sales, and Utang, using real timestamps.
+    """
+    from decimal import ROUND_HALF_UP
+
+    account_id = request.GET.get("account")
+    start_s    = request.GET.get("start")
+    end_s      = request.GET.get("end")
+    filt       = (request.GET.get("filter") or "all").lower()
+
+    start = parse_date(start_s) if start_s else None
+    end   = parse_date(end_s) if end_s else None
+
+    # -------------------- SALES: CASH --------------------
+    cash_qs = SalesCash.objects.select_related("product")
+    if account_id:
+        cash_qs = cash_qs.filter(account_id=account_id)
+    if start:
+        cash_qs = cash_qs.filter(created_at__date__gte=start)
+    if end:
+        cash_qs = cash_qs.filter(created_at__date__lte=end)
+    cash_qs = cash_qs.order_by("-created_at", "-id")
+
+    cash_list = []
+    for sc in cash_qs:
+        line_total = Decimal(sc.amount or 0)
+        if sc.product_id and sc.quantity and sc.product and line_total == (sc.product.selling_price or 0):
+            line_total *= sc.quantity
+
+        sort_dt = sc.created_at
+        desc = f"{sc.product.product_name} ({sc.quantity} pcs)" if sc.product_id else "Sale"
+
+        cash_list.append({
+            "type": "sale",
+            "category": "Sale",
+            "description": desc,
+            "amount": float(line_total),
+            "payment_method": "Cash",
+            "date": sort_dt.isoformat(),
+            "_sort_dt": sort_dt.timestamp(),
+            "_seq": sc.id,
+        })
+
+    # -------------------- SALES: CREDIT (UTANG) --------------------
+    credit_qs = SalesCredit.objects.select_related("product")
+    if account_id:
+        credit_qs = credit_qs.filter(account_id=account_id)
+    if start:
+        credit_qs = credit_qs.filter(created_at__date__gte=start)
+    if end:
+        credit_qs = credit_qs.filter(created_at__date__lte=end)
+    credit_qs = credit_qs.order_by("-created_at", "-id")
+
+    credit_list = []
+    for cr in credit_qs:
+        line_total = Decimal(cr.amount or 0)
+        if cr.product_id and cr.quantity and cr.product and line_total == (cr.product.selling_price or 0):
+            line_total *= cr.quantity
+
+        base = f"{cr.product.product_name} ({cr.quantity} pcs)" if cr.product_id else "Utang Sale"
+        desc = f"{base} (Paid)" if cr.status == 1 else f"{base} (Unpaid)"
+
+        sort_dt = cr.created_at
+        credit_list.append({
+            "type": "sale",
+            "category": "Sale",
+            "description": desc,
+            "amount": float(line_total),
+            "payment_method": "Utang",
+            "date": sort_dt.isoformat(),
+            "_sort_dt": sort_dt.timestamp(),
+            "_seq": cr.id,
+        })
+
+    # -------------------- EXPENSES --------------------
+    exp_qs = Expense.objects.select_related("product")
+    if account_id:
+        exp_qs = exp_qs.filter(account_id=account_id)
+    if start:
+        exp_qs = exp_qs.filter(created_at__date__gte=start)
+    if end:
+        exp_qs = exp_qs.filter(created_at__date__lte=end)
+    exp_qs = exp_qs.order_by("-created_at", "-id")
+
+    expenses_list = []
+
+    def _match_stockin_qty_for_expense(e):
+        if not e.product_id:
+            return None
+        si_qs = StockIn.objects.filter(product_id=e.product_id)
+        if account_id:
+            si_qs = si_qs.filter(account_id=account_id)
+        si_qs = si_qs.filter(created_at__date=e.created_at.date()).select_related("product")
+        if not si_qs.exists():
+            latest = StockIn.objects.filter(product_id=e.product_id).order_by("-created_at").first()
+            if latest and latest.purchase_price:
+                try:
+                    return int(Decimal(e.amount) / Decimal(latest.purchase_price))
+                except Exception:
+                    return None
+            return None
+        amt = Decimal(e.amount or 0).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        for si in si_qs:
+            total = (Decimal(si.quantity) * Decimal(si.purchase_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if abs(total - amt) <= Decimal("0.01"):
+                return si.quantity
+        si_list = list(si_qs)
+        si_list.sort(key=lambda si: abs((Decimal(si.quantity) * Decimal(si.purchase_price)) - amt))
+        best = si_list[0] if si_list else None
+        return best.quantity if best else None
+
+    for e in exp_qs:
+        is_stockin = (
+            (e.category == Expense.INVENTORY_PURCHASE)
+            if hasattr(Expense, "INVENTORY_PURCHASE")
+            else (e.category == "Inventory Purchase")
+        )
+        category = "Stock-in" if is_stockin else "Expense"
+
+        if e.product_id:
+            name = e.product.product_name
+            if is_stockin:
+                qty = getattr(e, "quantity", None) or _match_stockin_qty_for_expense(e)
+                desc = f"{name} ({qty} pcs)" if qty else name
+            else:
+                desc = e.description or name
+        else:
+            desc = e.description or e.category or "Expense"
+
+        sort_dt = e.created_at
+        expenses_list.append({
+            "type": "expense",
+            "category": category,
+            "description": desc,
+            "amount": float(e.amount or 0),
+            "payment_method": None,
+            "date": sort_dt.isoformat(),
+            "_sort_dt": sort_dt.timestamp(),
+            "_seq": e.id,
+        })
+
+    # -------------------- MERGE + FILTER + SORT --------------------
+    combined = cash_list + credit_list + expenses_list
+
+    if filt == "sales":
+        combined = [x for x in combined if x["type"] == "sale"]
+    elif filt == "expenses":
+        combined = [x for x in combined if x["type"] == "expense"]
+
+    combined.sort(key=lambda x: (x["_sort_dt"], x["_seq"]), reverse=True)
+
+    for x in combined:
+        x.pop("_sort_dt", None)
+
+    return Response(combined)
+
+# JESEL UPDATE --------------------------------------------------------------------------------------------------------------------------------
+
+@api_view(['GET'])
+def customer_debts(request, customer_id: int):
+    """
+    Returns sales grouped with products and sale-level due_date/status.
+
+    status rules (per sale):
+      - paid:    every line is paid (status==1) or amount<=0
+      - unpaid:  every line is unpaid (status==0) and amount>0
+      - partial: a mix of paid and unpaid (or some zero-amounts)
+    due_date rule: the latest non-null due_date among the sale's lines.
+    """
+    # Important: fetch ALL credit lines (both paid and unpaid) to compute sale status correctly
+    qs = (
+        SalesCredit.objects
+        .filter(customer_id=customer_id)
+        .select_related('product', 'sale')
+        .order_by('sale_id', 'id')
+    )
+
+    grouped = OrderedDict()
+
+    for sc in qs:
+        sale_id = sc.sale_id
+
+        # unit price: prefer amount/quantity; fallback to product.selling_price
+        if sc.quantity:
+            unit_price = float(sc.amount or 0) / sc.quantity
+        else:
+            unit_price = float(sc.product.selling_price) if sc.product else 0.0
+
+        product_item = {
+            "product_name": sc.product.product_name if sc.product else "",
+            "quantity": sc.quantity or 0,
+            "selling_price": unit_price,
+        }
+
+        if sale_id not in grouped:
+            grouped[sale_id] = {
+                "sale_id": sale_id,
+                "date": sc.credit_date.isoformat() if sc.credit_date else "",
+                "due_date": "",        # fill after loop
+                "status": "",          # fill after loop
+                "products": [],
+                # temp counters/holders
+                "__paid": 0,
+                "__unpaid": 0,
+                "__due_latest": None,
+            }
+
+        g = grouped[sale_id]
+        g["products"].append(product_item)
+
+        # temp counters for status calculation
+        is_paid_line = (sc.status == 1) or (float(sc.amount or 0) <= 0)
+        if is_paid_line:
+            g["__paid"] += 1
+        else:
+            g["__unpaid"] += 1
+
+        # track the latest due_date among lines
+        if sc.due_date:
+            if g["__due_latest"] is None or sc.due_date > g["__due_latest"]:
+                g["__due_latest"] = sc.due_date
+
+    # finalize per-sale fields
+    result = []
+    for sale in grouped.values():
+        paid, unpaid = sale["__paid"], sale["__unpaid"]
+
+        if unpaid == 0:
+            sale_status = "paid"
+        elif paid == 0:
+            sale_status = "unpaid"
+        else:
+            sale_status = "partial"
+
+        sale["status"] = sale_status
+        sale["due_date"] = sale["__due_latest"].isoformat() if sale["__due_latest"] else ""
+
+        # drop temp keys
+        for k in ("__paid", "__unpaid", "__due_latest"):
+            sale.pop(k, None)
+
+        result.append(sale)
+
+    return Response(result, status=status.HTTP_200_OK) 
+
+# Inside the 'apply_customer_payment' view: JESEL UPDATE ----------------------------------------------------------------------------------
+PAID = 1
+UNPAID = 0
+# PARTIAL = 2  # (optional) if you add this state later
+
+@api_view(['POST'])
+def apply_customer_payment(request, customer_id: int):
+    """
+    Applies a payment to a customer's outstanding SalesCredit.
+    Deduction is applied to the remaining total (stored in amount here).
+    """
+    try:
+        amt = Decimal(str(request.data.get('amount', 0)))
+    except Exception:
+        return Response({'error': 'Invalid amount'}, status=400)
+
+    if amt <= 0:
+        return Response({'error': 'Amount must be > 0'}, status=400)
+
+    # Only unpaid rows (where there's still an amount to cover)
+    qs = (
+        SalesCredit.objects
+        .filter(customer_id=customer_id, amount__gt=0)
+        .order_by('due_date', 'credit_date', 'id')
+    )
+
+    remaining_amt = amt
+    allocations = []
+
+    # (Optional) lock rows to avoid race conditions on concurrent payments
+    # with transaction.atomic():
+    for sc in qs:
+        if remaining_amt <= 0:
+            break
+
+        line_remaining = Decimal(sc.amount or 0)
+        applied = min(line_remaining, remaining_amt)
+
+        new_remaining = line_remaining - applied
+        sc.amount = new_remaining
+
+        # ✅ Write an integer to the IntegerField
+        if sc.amount <= 0:
+            sc.status = PAID
+            # (Optional) set paid_date
+            # sc.paid_date = timezone.now().date()
+
+        # If not fully paid, leave status as-is (0 = unpaid)
+        sc.save(update_fields=['amount', 'status'])  # add 'paid_date' if you set it
+
+        allocations.append({
+            'sale_id': sc.sale_id,
+            'applied': float(applied),
+            'remaining': float(sc.amount),
+            'due_date': sc.due_date.isoformat() if sc.due_date else ''
+        })
+
+        remaining_amt -= applied
+
+    return Response({
+        'allocations': allocations,
+        'applied_total': float(amt - remaining_amt),
+        'unapplied_balance': float(remaining_amt),
+    }, status=200)
 
 
 

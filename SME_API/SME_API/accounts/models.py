@@ -1,5 +1,7 @@
 # accounts/models.py
 from django.db import models # type: ignore
+from django.core.validators import RegexValidator # type: ignore
+
 
 
 # ADD CAPITAL
@@ -18,12 +20,25 @@ class CapitalTransaction(models.Model):
     def __str__(self):
         return f"{self.transaction_type.capitalize()} - {self.amount}"
 
+
 class Account(models.Model):
-    first_name = models.CharField(max_length=100)
-    middle_name = models.CharField(max_length=50, default='N/A')
-    last_name = models.CharField(max_length=100)
+    first_name   = models.CharField(max_length=100, blank=True, default="")
+    middle_name  = models.CharField(max_length=50,  blank=True, default="")
+    last_name    = models.CharField(max_length=100, blank=True, default="")
     phone_number = models.CharField(max_length=15, unique=True)
-    pin = models.CharField(max_length=4)
+    pin          = models.CharField(
+        max_length=4,
+        validators=[RegexValidator(r'^\d{4}$', 'PIN must be exactly 4 digits.')]
+    )
+
+    @property
+    def full_name(self) -> str:
+        # joins only non-empty parts, no "N/A"
+        return " ".join(p for p in [self.first_name, self.middle_name, self.last_name] if p).strip()
+
+    def __str__(self) -> str:
+        label = self.full_name or "(no name)"
+        return f"{label} — {self.phone_number}"
 
 class Product(models.Model):
     product_name = models.CharField(max_length=255)
@@ -49,27 +64,40 @@ class Sale(models.Model):
 
 
 class Expense(models.Model):
+    INVENTORY_PURCHASE = "Inventory Purchase"
+    CATEGORY_CHOICES = [
+        (INVENTORY_PURCHASE, "Inventory Purchase"),
+        ("Rent", "Rent"),
+        ("Utilities", "Utilities"),
+        ("Other", "Other"),
+    ]
+
     account = models.ForeignKey(Account, on_delete=models.CASCADE)
-    product = models.ForeignKey(Product, on_delete=models.SET_NULL, null=True, blank=True)  # ✅ Add this
+    product = models.ForeignKey(Product, on_delete=models.SET_NULL, null=True, blank=True)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
-    category = models.CharField(max_length=50)
-    description = models.TextField()
+    category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)    # ⬅️ choices (optional)
+    description = models.TextField(blank=True, null=True)                   # ⬅️ allow blank
     receipt = models.ImageField(upload_to='receipts/', blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
 
 
+
 class StockIn(models.Model):
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)  # temporary
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
-    quantity = models.IntegerField(default=1)  # Total added
-    remaining_quantity = models.IntegerField(default=1)  # Decreases on sale
+    quantity = models.IntegerField(default=1)
+    remaining_quantity = models.IntegerField(default=1)
     purchase_price = models.DecimalField(max_digits=10, decimal_places=2)
     markup_rate = models.FloatField()
-    image = models.ImageField(upload_to='uploads/', null=True, blank=True)  # ✅ ADD THIS LINE
+    image = models.ImageField(upload_to='uploads/', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def __str__(self):
-        return f"{self.product.product_name} @ {self.purchase_price} ({self.remaining_quantity} left)"
+    @property
+    def total_cost(self):
+        return self.quantity * self.purchase_price
+
+
     
 class SaleItem(models.Model):
     sale = models.ForeignKey(Sale, on_delete=models.CASCADE)
@@ -97,6 +125,7 @@ class SalesCash(models.Model):
     quantity = models.IntegerField(default=1)
     date = models.DateField()
     or_num = models.CharField(max_length=50)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 class Customer(models.Model):
     first_name = models.CharField(max_length=100)
@@ -118,3 +147,4 @@ class SalesCredit(models.Model):
     paid_date = models.DateField(null=True, blank=True)
     or_num = models.CharField(max_length=50)
     due_date = models.DateField(null=True, blank=True)  # ✅ ADD THIS LINE
+    created_at = models.DateTimeField(auto_now_add=True)
