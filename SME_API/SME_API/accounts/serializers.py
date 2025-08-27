@@ -62,6 +62,7 @@ class AddProductStockInSerializer(serializers.Serializer):
 
         # find or create product
         product = Product.objects.filter(
+            account_id=account_id,
             product_name__iexact=normalized_name,
             category=category
         ).first()
@@ -69,6 +70,7 @@ class AddProductStockInSerializer(serializers.Serializer):
         if not product:
             selling_price = purchase_price * (Decimal(1) + Decimal(markup_rate) / Decimal(100))
             product = Product.objects.create(
+                account_id=account_id,  
                 product_name=normalized_name,
                 category=category,
                 selling_price=selling_price
