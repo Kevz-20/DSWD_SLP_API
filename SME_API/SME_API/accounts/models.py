@@ -2,16 +2,13 @@
 from django.db import models # type: ignore
 from django.core.validators import RegexValidator # type: ignore
 
-
-
 # ADD CAPITAL
-
 class CapitalTransaction(models.Model):
     TRANSACTION_TYPE_CHOICES = [
         ('deposit', 'Deposit'),
         ('withdraw', 'Withdraw'),
     ]
-
+    account = models.ForeignKey('Account', on_delete=models.CASCADE, related_name='capital_transactions', null=True, blank=True  )   
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPE_CHOICES)
     remarks = models.TextField(blank=True, null=True)
@@ -41,6 +38,7 @@ class Account(models.Model):
         return f"{label} — {self.phone_number}"
 
 class Product(models.Model):
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='products', null=True, blank=True ) 
     product_name = models.CharField(max_length=255)
     category = models.CharField(max_length=100)
     selling_price = models.DecimalField(max_digits=10, decimal_places=2) 
@@ -54,6 +52,7 @@ class Product(models.Model):
 
 
 class Sale(models.Model):
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='sales', null=True, blank=True ) 
     product = models.ForeignKey(Product, on_delete=models.CASCADE, null=True, blank=True)
     quantity = models.IntegerField(default=1)
     selling_price = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
@@ -72,7 +71,7 @@ class Expense(models.Model):
         ("Other", "Other"),
     ]
 
-    account = models.ForeignKey(Account, on_delete=models.CASCADE)
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True )
     product = models.ForeignKey(Product, on_delete=models.SET_NULL, null=True, blank=True)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)    # ⬅️ choices (optional)
@@ -81,10 +80,8 @@ class Expense(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
-
-
 class StockIn(models.Model):
-    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)  # temporary
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='stockins', null=True, blank=True ) 
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
     quantity = models.IntegerField(default=1)
     remaining_quantity = models.IntegerField(default=1)
@@ -96,8 +93,6 @@ class StockIn(models.Model):
     @property
     def total_cost(self):
         return self.quantity * self.purchase_price
-
-
     
 class SaleItem(models.Model):
     sale = models.ForeignKey(Sale, on_delete=models.CASCADE)
@@ -108,10 +103,8 @@ class SaleItem(models.Model):
     def __str__(self):
         return f"{self.stockin.product.product_name} x{self.quantity}"
 
-
-
 class Capital(models.Model):
-    account = models.ForeignKey(Account, on_delete=models.CASCADE)
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True )
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     description = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
@@ -128,6 +121,7 @@ class SalesCash(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 class Customer(models.Model):
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='customers', null=True, blank=True ) 
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
     address = models.TextField()
@@ -135,16 +129,22 @@ class Customer(models.Model):
     credit_limit = models.DecimalField(max_digits=10, decimal_places=2, default=1000.00) 
     
 
+# accounts/models.py
 class SalesCredit(models.Model):
-    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True) 
-    sale = models.ForeignKey(Sale, on_delete=models.CASCADE)
-    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    class CreditStatus(models.IntegerChoices):
+        UNPAID  = 0, "Unpaid"
+        PARTIAL = 1, "Partially Paid"
+        PAID    = 2, "Paid"
+
+    account  = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True) 
+    sale     = models.ForeignKey(Sale, on_delete=models.CASCADE)
+    product  = models.ForeignKey(Product, on_delete=models.CASCADE)
     customer = models.ForeignKey(Customer, on_delete=models.CASCADE)
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    amount   = models.DecimalField(max_digits=10, decimal_places=2)
     quantity = models.IntegerField(default=1)
-    status = models.IntegerField()  # 1 = paid, 0 = unpaid
+    status   = models.IntegerField(choices=CreditStatus.choices, default=CreditStatus.UNPAID)
     credit_date = models.DateField()
-    paid_date = models.DateField(null=True, blank=True)
-    or_num = models.CharField(max_length=50)
-    due_date = models.DateField(null=True, blank=True)  # ✅ ADD THIS LINE
-    created_at = models.DateTimeField(auto_now_add=True)
+    paid_date   = models.DateField(null=True, blank=True)
+    or_num      = models.CharField(max_length=50)
+    due_date    = models.DateField(null=True, blank=True)
+    created_at  = models.DateTimeField(auto_now_add=True)

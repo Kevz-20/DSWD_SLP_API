@@ -25,8 +25,6 @@ class AccountSerializer(serializers.ModelSerializer):
         fields = ['id', 'first_name', 'middle_name', 'last_name', 'phone_number', 'pin', 'full_name']
 
 
-
-
 # ADD CAPITAL
 
 class CapitalTransactionSerializer(serializers.ModelSerializer):
@@ -62,6 +60,7 @@ class AddProductStockInSerializer(serializers.Serializer):
 
         # find or create product
         product = Product.objects.filter(
+            account_id=account_id,
             product_name__iexact=normalized_name,
             category=category
         ).first()
@@ -69,6 +68,7 @@ class AddProductStockInSerializer(serializers.Serializer):
         if not product:
             selling_price = purchase_price * (Decimal(1) + Decimal(markup_rate) / Decimal(100))
             product = Product.objects.create(
+                account_id=account_id,  
                 product_name=normalized_name,
                 category=category,
                 selling_price=selling_price
@@ -429,10 +429,6 @@ class CreditTransactionSerializer(serializers.Serializer):
     items = CreditItemSerializer(many=True)
 
 
-
-
-
-
 class AccountNameSerializer(serializers.Serializer):
     first_name = serializers.CharField()
     middle_name = serializers.CharField()
@@ -449,5 +445,4 @@ class FullNameSecureUpdateSerializer(serializers.Serializer):
     first_name = serializers.CharField(max_length=100)
     middle_name = serializers.CharField(max_length=50, required=False, allow_blank=True)
     last_name = serializers.CharField(max_length=100)
-
 
