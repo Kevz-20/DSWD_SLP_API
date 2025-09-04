@@ -166,9 +166,9 @@ def product_list(request):
     if keyword:
         products = products.filter(product_name__icontains=keyword)
 
-    serializer = ProductSerializer(products.order_by('product_name'), many=True)
+    products = products.order_by('product_name')  # order after filtering
+    serializer = ProductSerializer(products, many=True)
     return Response(serializer.data, status=status.HTTP_200_OK)
-
 
 # THIS VIEW FOR MANAGE INVENTORY PAGE ( MANAGE INVENTORY ) ----------------------------------------------------------------------------------------------------------------------
 @api_view(['GET'])
