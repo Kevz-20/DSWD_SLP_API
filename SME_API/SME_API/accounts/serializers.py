@@ -1,9 +1,8 @@
 # accounts/serializers.py
-from datetime import date
-from decimal import Decimal
-
+from datetime import date,time as dtime,datetime as dt_datetime, time as dt_time
+from decimal import Decimal 
 from django.utils import timezone  # type: ignore
-from django.db.models import Sum # type: ignore
+from django.db.models import Sum,Case,When, F, DecimalField # type: ignore
 from rest_framework import serializers  # type: ignore
 
 from decimal import Decimal
@@ -12,7 +11,7 @@ from .models import Product, StockIn
 
 from .models import (
     Account, CapitalTransaction, Expense, Product, Sale, SaleItem,
-    StockIn, SalesCash, Customer, SalesCredit
+    StockIn, SalesCash, Customer, SalesCredit, Payable, PayablePayment
 )
 
 
@@ -55,37 +54,47 @@ class AddProductStockInSerializer(serializers.Serializer):
 
         normalized_name = validated_data['product_name'].strip().title()
         category = validated_data['category'].strip()
-        quantity = validated_data['quantity']
+        quantity = int(validated_data['quantity'])
         purchase_price = validated_data['purchase_price']
-        markup_rate = validated_data['markup_rate']
+        markup_rate = float(validated_data['markup_rate'])
         image = validated_data.get('image')
 
-        # find or create product
+        # 🔒 Per-account lookup
         product = Product.objects.filter(
-            product_name__iexact=normalized_name,
-            category=category
+            account_id=account_id,
+            product_name__iexact=normalized_name
         ).first()
 
         if not product:
             selling_price = purchase_price * (Decimal(1) + Decimal(markup_rate) / Decimal(100))
             product = Product.objects.create(
+                account_id=account_id,
                 product_name=normalized_name,
                 category=category,
-                selling_price=selling_price
+                selling_price=selling_price,
+                image=image if image else None
             )
+        else:
+            # Keep category up to date, and set image if empty
+            if product.category != category:
+                product.category = category
+            if (not product.image) and image:
+                product.image = image
+            product.save(update_fields=['category', 'image'] if image else ['category'])
 
-        # create StockIn (IMPORTANT: attach account_id)
+        # Create StockIn tied to this account
         StockIn.objects.create(
-            account_id=account_id,                 # ← ensures the signal creates Expense for this account
+            account_id=account_id,
             product=product,
             quantity=quantity,
             remaining_quantity=quantity,
             purchase_price=purchase_price,
             markup_rate=markup_rate,
-            image=image
+            image=image  # optional batch photo
         )
 
         return product
+
 
 
 
@@ -101,59 +110,57 @@ class SalesCashSerializer(serializers.ModelSerializer):
         fields = ['product_name', 'quantity', 'selling_price', 'or_num', 'sale', 'date']
 
     def create(self, validated_data):
+        from datetime import date  # local import to avoid global name clashes
         product_name = validated_data.pop('product_name')
-        quantity = validated_data.pop('quantity')
-        selling_price = validated_data.pop('selling_price')  # treated as you originally did
+        quantity = int(validated_data.pop('quantity'))
+        selling_price = validated_data.pop('selling_price')
 
         # Look up product
         product = Product.objects.filter(product_name__iexact=product_name).first()
         if not product:
             raise serializers.ValidationError({"product_name": "Product does not exist."})
 
-        # Check stock via StockIn
-        batches = StockIn.objects.filter(product=product, remaining_quantity__gt=0).order_by('created_at')
+        # Check stock
+        batches = (StockIn.objects
+                   .filter(product=product, remaining_quantity__gt=0)
+                   .order_by('created_at'))
         total_available = sum(b.remaining_quantity for b in batches)
         if total_available < quantity:
             raise serializers.ValidationError({"quantity": f"Only {total_available} items left in stock."})
 
-        # Create Sale (no 'account' field on Sale model)
+        # Create Sale
         sale = Sale.objects.create(
-            product=product,                 # legacy fields kept for compatibility
+            product=product,
             quantity=quantity,
-            selling_price=selling_price,
+            selling_price=selling_price,  # legacy
             sale_type='cash',
             created_at=timezone.now()
         )
 
-        # FIFO deduct from batches + create SaleItem lines
-        q = int(quantity)
+        # FIFO + SaleItems (unit at selling_price to keep legacy behavior)
+        q = quantity
         for batch in batches:
             if q == 0:
                 break
             take = min(q, batch.remaining_quantity)
-
-            # Use provided selling_price as the unit price (matches your existing behavior)
-            SaleItem.objects.create(
-                sale=sale,
-                stockin=batch,
-                quantity=take,
-                unit_price=selling_price
-            )
-
+            SaleItem.objects.create(sale=sale, stockin=batch, quantity=take, unit_price=selling_price)
             batch.remaining_quantity -= take
             batch.save(update_fields=['remaining_quantity'])
             q -= take
 
-        # Create SalesCash row (keeps your original 'amount' behavior)
+        # IMPORTANT: amount should be total, not unit price
+        line_total = (selling_price * Decimal(quantity)).quantize(Decimal('0.01'))
+
         sales_cash = SalesCash.objects.create(
             sale=sale,
             product=product,
-            amount=selling_price,                    # ← matches your original code
+            amount=line_total,
             quantity=quantity,
-            date=validated_data.get(('date', dt_date.today())), # type: ignore
+            date=validated_data.get('date', date.today()),
             or_num=validated_data.get('or_num', f"OR-{timezone.now().timestamp()}")
         )
         return sales_cash
+
 
 
 # For Utang Add New Customer to the List
@@ -272,10 +279,10 @@ class SalesCreditCreateSerializer(serializers.Serializer):
             sale=sale,
             product=product,
             customer=customer,
-            amount=selling_price,     # ← if you want total, change to selling_price * quantity
+            amount=selling_price,         # keep your current behavior (unit). If you want TOTAL, change to selling_price * quantity
             quantity=quantity,
             status=0,
-            credit_date=dt_date.today(), # type: ignore
+            credit_date=date.today(),     # ← was dt_date.today()
             paid_date=None,
             or_num=or_num,
             due_date=due_date,
@@ -324,48 +331,96 @@ class BatchSerializer(serializers.ModelSerializer):
 
 # ✅ FIXED ProductSerializer
 
+# ✅ DROP-IN REPLACEMENT for ProductSerializer in accounts/serializers.py
+
 class ProductSerializer(serializers.ModelSerializer):
-    quantity = serializers.SerializerMethodField()  # ✅ Use method, not source='stock'
+    quantity = serializers.SerializerMethodField()
     purchase_price = serializers.SerializerMethodField()
     markup_rate = serializers.SerializerMethodField()
     selling_price = serializers.SerializerMethodField()
     category = serializers.CharField(read_only=True)
-    image = serializers.ImageField(read_only=True) 
+
+    image_url = serializers.SerializerMethodField()
+    thumbnail_url = serializers.SerializerMethodField()  # ← NEW
 
     class Meta:
         model = Product
         fields = [
             'id', 'product_name', 'category', 'quantity',
-            'purchase_price', 'markup_rate', 'selling_price','image'
+            'purchase_price', 'markup_rate', 'selling_price',
+            'image_url', 'thumbnail_url'  # ← include new field
         ]
 
     def get_quantity(self, obj):
-        total_quantity = StockIn.objects.filter(product=obj).aggregate(
-        total=Sum('remaining_quantity')
-    )['total'] or 0
-        return int(total_quantity)
+        return int(
+            StockIn.objects
+            .filter(product=obj, account_id=obj.account_id)
+            .aggregate(total=Sum('remaining_quantity'))['total'] or 0
+        )
 
+    def _latest_stockin(self, obj):
+        return (
+            StockIn.objects
+            .filter(product=obj, account_id=obj.account_id)
+            .order_by('-created_at')
+            .first()
+        )
 
     def get_purchase_price(self, obj):
-        latest_stockin = StockIn.objects.filter(product=obj).order_by('-created_at').first()
-        return latest_stockin.purchase_price if latest_stockin else 0.00
+        si = self._latest_stockin(obj)
+        return si.purchase_price if si else Decimal("0.00")
 
     def get_markup_rate(self, obj):
-        latest_stockin = StockIn.objects.filter(product=obj).order_by('-created_at').first()
-        return latest_stockin.markup_rate if latest_stockin else 0.00
+        si = self._latest_stockin(obj)
+        return si.markup_rate if si else 0.0
 
     def get_selling_price(self, obj):
-        latest_stockin = StockIn.objects.filter(product=obj).order_by('-created_at').first()
-        if latest_stockin:
+        si = self._latest_stockin(obj)
+        if si:
             return round(
-            latest_stockin.purchase_price * (Decimal(1) + Decimal(latest_stockin.markup_rate) / Decimal(100)),
-            2
-        )
+                si.purchase_price * (Decimal(1) + Decimal(si.markup_rate) / Decimal(100)),
+                2
+            )
         return Decimal("0.00")
 
+    def get_image_url(self, obj):
+        """
+        Full image for detail screens.
+        Prefer Product.image; fall back to latest StockIn.image.
+        """
+        request = self.context.get('request')
+        if obj.image:
+            url = obj.image.url
+        else:
+            si = (
+                StockIn.objects
+                .filter(product=obj, account_id=obj.account_id, image__isnull=False)
+                .order_by('-created_at')
+                .first()
+            )
+            url = si.image.url if si and si.image else None
+        return request.build_absolute_uri(url) if (request and url) else url
+
+    def get_thumbnail_url(self, obj):
+        """
+        Small image for list/grid (RecordSalesPage).
+        Prefer Product.thumbnail; if missing, gracefully fall back to image_url
+        so the UI still shows something while you backfill thumbnails.
+        """
+        request = self.context.get('request')
+        # If the Product has a generated thumbnail, use it.
+        if getattr(obj, 'thumbnail', None):
+            url = obj.thumbnail.url if obj.thumbnail else None
+            return request.build_absolute_uri(url) if (request and url) else url
+
+        # Fallback: reuse whatever get_image_url would return (may be large).
+        # This avoids breaking the UI before all thumbnails exist.
+        return self.get_image_url(obj)
 
 
-    
+
+
+
 # EXPENSES
 
 class ExpenseSerializer(serializers.ModelSerializer):
@@ -431,8 +486,6 @@ class CreditTransactionSerializer(serializers.Serializer):
 
 
 
-
-
 class AccountNameSerializer(serializers.Serializer):
     first_name = serializers.CharField()
     middle_name = serializers.CharField()
@@ -447,7 +500,139 @@ class AccountNameSerializer(serializers.Serializer):
 class FullNameSecureUpdateSerializer(serializers.Serializer):
     pin = serializers.RegexField(regex=r'^\d{4}$', max_length=4)
     first_name = serializers.CharField(max_length=100)
-    middle_name = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    middle_name = serializers.CharField(max_length=50, required=False, allow_blank=True)    
     last_name = serializers.CharField(max_length=100)
+
+
+class PayableSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Payable
+        fields = [
+            'id', 'account', 'supplier_name',
+            'original_amount', 'remaining_amount',
+            'due_date', 'note', 'is_paid',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+class PayableCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Payable
+        fields = ['account', 'supplier_name', 'original_amount', 'due_date', 'note']
+
+    def create(self, validated_data):
+        p = Payable(**validated_data)
+        p.remaining_amount = p.original_amount
+        p.is_paid = (p.remaining_amount == 0)
+        p.save()
+        return p
+
+# accounts/serializers.py (replace ONLY PayablePaymentSerializer)
+
+
+class PayablePaymentSerializer(serializers.ModelSerializer):
+    # Optional label to show in the cash ledger "Payment - <item_label>"
+    item_label = serializers.CharField(write_only=True, required=False, allow_blank=True)
+
+    # Read-only extras so the client can refresh UI immediately
+    new_balance = serializers.SerializerMethodField(read_only=True)
+    transaction = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = PayablePayment
+        fields = ['id', 'payable', 'amount', 'date', 'note', 'created_at',
+                  'item_label', 'new_balance', 'transaction']
+        read_only_fields = ['id', 'created_at', 'new_balance', 'transaction']
+
+    def validate(self, attrs):
+        payable = attrs['payable']
+        amount = attrs['amount']
+        if payable.is_paid:
+            raise serializers.ValidationError("This payable is already marked as paid.")
+        if amount <= 0:
+            raise serializers.ValidationError("Amount must be greater than 0.")
+        if amount > payable.remaining_amount:
+            raise serializers.ValidationError("Payment exceeds remaining amount.")
+        return attrs
+
+    def _compute_cash_balance(self, account_id=None):
+        # Inline helper so you don’t need utils.py
+        from .models import CapitalTransaction
+        qs = CapitalTransaction.objects.all()
+        if account_id:
+            qs = qs.filter(account_id=account_id)
+        return (qs.aggregate(
+            bal=Sum(
+                Case(
+                    When(transaction_type='deposit', then=F('amount')),
+                    When(transaction_type='withdraw', then=-F('amount')),
+                    default=0,
+                    output_field=DecimalField(max_digits=12, decimal_places=2)
+                )
+            )
+        )['bal'] or 0)
+
+    def create(self, validated_data):
+        from .models import CapitalTransaction
+
+        # Pop write-only extras
+        item_label = (validated_data.pop('item_label', '') or '').strip()
+
+        # 1) Create the payment
+        payment = super().create(validated_data)
+
+        # 2) Update the payable (already handled in your current create, kept here)
+        p = payment.payable
+        p.remaining_amount = p.remaining_amount - payment.amount
+        if p.remaining_amount <= 0:
+            p.remaining_amount = 0
+            p.is_paid = True
+        p.save(update_fields=['remaining_amount', 'is_paid', 'updated_at'])
+
+        # 3) Mirror to cash ledger as WITHDRAW
+        label = item_label or p.supplier_name
+        # Align the ledger timestamp to the payment date (start of day, aware)
+        pay_dt = dt_datetime.combine(payment.date, dt_time.min)
+
+        tx = CapitalTransaction.objects.create(
+            account=p.account,     # or account_id=p.account_id (both OK if FK field is 'account')
+            amount=payment.amount,
+            transaction_type='withdraw',
+            remarks=f"Payment - {label}",
+            date=pay_dt
+        )
+
+        # 4) Cache for SerializerMethodField getters
+        self._tx = tx
+        self._new_balance = self._compute_cash_balance(account_id=p.account_id)
+
+        return payment
+
+    # === Read-only fields for response ===
+    def get_new_balance(self, obj):
+        # Prefer cached value from create(); fallback compute (e.g., when used for GET)
+        if hasattr(self, '_new_balance'):
+            return float(self._new_balance)
+        p = obj.payable
+        return float(self._compute_cash_balance(account_id=p.account_id))
+
+    def get_transaction(self, obj):
+        # Small preview block for client UI
+        tx = getattr(self, '_tx', None)
+        if not tx:
+            # Best effort fallback if serializer is used for read without recent create
+            return {
+                "type": "withdraw",
+                "amount": float(obj.amount),
+                "description": f"Payment - {obj.payable.supplier_name}",
+                "date": obj.date.isoformat()
+            }
+        return {
+            "id": tx.id,
+            "type": "withdraw",
+            "amount": float(tx.amount),
+            "description": tx.remarks or "",
+            "date": tx.date.isoformat()
+        }
 
 

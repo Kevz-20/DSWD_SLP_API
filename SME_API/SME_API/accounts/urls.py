@@ -1,7 +1,11 @@
 from django.urls import path # type: ignore
-from . import views
-from .views import CapitalTransactionListCreateView 
-from django.urls import path # type: ignore
+from . import views 
+from .views import CapitalTransactionListCreateView,PayableViewSet, payables_summary,ledger_pdf
+from rest_framework.routers import DefaultRouter # type: ignore
+from django.urls import path, include # type: ignore
+
+router = DefaultRouter()
+router.register(r'payables', PayableViewSet, basename='payables') # type: ignore
 
 urlpatterns = [
     # Account
@@ -49,5 +53,14 @@ urlpatterns = [
 
     #Expense Report
     path('expenses/summary/', views.expenses_summary),
+    
+    #Balance Sheet
+    path('balance-sheet/', views.balance_sheet, name='balance_sheet'),
 
+    #Ledger
+    path('reports/ledger.pdf', ledger_pdf, name='ledger-pdf'),
+
+    #Account Payable
+    path('payables/summary/', views.payables_summary),
+    path('', include(router.urls)),  # type: ignore
 ]
