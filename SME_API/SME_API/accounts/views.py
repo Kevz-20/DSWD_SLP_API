@@ -693,8 +693,12 @@ def customers(request):
     account_id = request.GET.get('account') or request.GET.get('account_id')
     if not account_id:
         return Response({'error': 'account is required'}, status=400)
+
     qs = Customer.objects.filter(account_id=account_id).order_by('first_name', 'last_name')
-    return Response(CustomerSerializer(qs, many=True).data)
+    # 👇 add context with account_id so remaining_credit is computed per account
+    data = CustomerSerializer(qs, many=True, context={'account_id': account_id}).data
+    return Response(data)
+
 
 
 
@@ -725,13 +729,16 @@ def customer_record(request, customer_id):
     except Customer.DoesNotExist:
         return Response({'error': 'Customer not found'}, status=404)
 
+    account_id = request.GET.get('account') or request.GET.get('account_id')  # ⬅️ add this
     sales_credits = SalesCredit.objects.filter(customer=customer)
 
     data = {
-        "Customer": CustomerSerializer(customer).data,
+        # ⬇️ pass context here too
+        "Customer": CustomerSerializer(customer, context={'account_id': account_id}).data,
         "SalesCredits": SalesCreditRecordSerializer(sales_credits, many=True).data
     }
     return Response(data)
+
 
 
 @api_view(['GET'])

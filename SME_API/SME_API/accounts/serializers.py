@@ -165,9 +165,27 @@ class SalesCashSerializer(serializers.ModelSerializer):
 
 # For Utang Add New Customer to the List
 class CustomerSerializer(serializers.ModelSerializer):
+    remaining_credit = serializers.SerializerMethodField()
+
     class Meta:
         model = Customer
-        fields = '__all__'
+        fields = [
+            'id', 'first_name', 'last_name', 'address', 'contact_num',
+            'credit_limit', 'remaining_credit'
+        ]
+
+    def get_remaining_credit(self, obj):
+        # account scoping (pass account_id via serializer context from the view)
+        account_id = self.context.get('account_id')
+        qs = SalesCredit.objects.filter(customer=obj, status=0)
+        if account_id:
+            qs = qs.filter(account_id=account_id)
+
+        total_unpaid = qs.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        # OPTION A (recommended label “Remaining credit”):
+        limit = obj.credit_limit or Decimal('0.00')
+        return float(limit - total_unpaid)
 
 
 class SaleItemSerializer(serializers.ModelSerializer):
