@@ -4,7 +4,7 @@ from rest_framework.response import Response  # type: ignore  # ✅ Correct impo
 from rest_framework import status  # type: ignore  # ✅ Correct import
 from django.utils import timezone  # type: ignore  # ✅ Correct import
 from .models import Account, CapitalTransaction, Expense, Product, SaleItem, StockIn, SalesCash, Sale, SalesCredit, Customer, Account, Payable, PayablePayment
-from .serializers import AccountSerializer, BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer, AccountNameSerializer, ExpenseSerializer, UpdateStockInSerializer, PayableSerializer, PayableCreateSerializer, PayablePaymentSerializer
+from .serializers import AccountSerializer, BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerCreateSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer, AccountNameSerializer, ExpenseSerializer, UpdateStockInSerializer, PayableSerializer, PayableCreateSerializer, PayablePaymentSerializer
 from datetime import date, time, datetime, time as dt_time, date as dt_date, timedelta
 from rest_framework import viewsets, generics  # type: ignore  # ✅ Correct import
 from django.db.models import Sum  # type: ignore
@@ -490,33 +490,34 @@ def record_sale(request):
     with transaction.atomic():
         # Step 1: Load/create customer if UTANG
         customer = None
-        if sale_type == 'utang':
-            if not customer_data:
-                return Response({'error': 'customer_data required for utang sale'}, status=400)
+    if sale_type == 'utang':
+        if not customer_data:
+            return Response({'error': 'customer_data required for utang sale'}, status=400)
 
-            customer_id = customer_data.get('id')
-            if customer_id:
-                try:
-                    customer = Customer.objects.get(id=customer_id)
-                except Customer.DoesNotExist:
-                    return Response({'error': 'Customer not found with given ID'}, status=400)
-            else:
-                first_name = (customer_data.get('first_name') or '').strip() or 'Unknown'
-                last_name  = (customer_data.get('last_name')  or '').strip() or 'Unknown'
-                contact    = (customer_data.get('contact_num') or '').strip()
-                address    = (customer_data.get('address') or '').strip()
-                if not contact:
-                    return Response({'error': 'contact_num is required to create a new customer'}, status=400)
+        customer_id = customer_data.get('id')
+        if customer_id:
+            try:
+                customer = Customer.objects.get(id=customer_id, account_id=account_id)  # scoped to account
+            except Customer.DoesNotExist:
+                return Response({'error': 'Customer not found with given ID for this account'}, status=400)
+        else:
+            first_name = (customer_data.get('first_name') or '').strip() or 'Unknown'
+            last_name  = (customer_data.get('last_name')  or '').strip() or 'Unknown'
+            contact    = (customer_data.get('contact_num') or '').strip()
+            address    = (customer_data.get('address') or '').strip()
+            if not contact:
+                return Response({'error': 'contact_num is required to create a new customer'}, status=400)
 
-                customer = Customer.objects.filter(contact_num__iexact=contact).first()
-                if not customer:
-                    customer = Customer.objects.create(
-                        first_name=first_name,
-                        last_name=last_name,
-                        address=address,
-                        contact_num=contact
-                        # (Optional) add account FK on Customer if you want per-account customers
-                    )
+            # Try to reuse an existing customer under the SAME account
+            customer = Customer.objects.filter(contact_num__iexact=contact, account_id=account_id).first()
+            if not customer:
+                customer = Customer.objects.create(
+                    account_id=account_id,   # <- IMPORTANT
+                    first_name=first_name,
+                    last_name=last_name,
+                    address=address,
+                    contact_num=contact
+                )
 
         # Step 2: Prepare products and validate stock (per-account + FIFO)
         product_rows = []  # [(product, qty, [batches])]
@@ -659,13 +660,15 @@ def record_sale(request):
 
 
 
+
 @api_view(['POST'])
 def create_customer(request):
-    serializer = CustomerSerializer(data=request.data)
-    if serializer.is_valid():
-        serializer.save()
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    ser = CustomerCreateSerializer(data=request.data)
+    ser.is_valid(raise_exception=True)
+    customer = ser.save()  # <- persists account_id
+    # return the read shape the app expects
+    return Response(CustomerSerializer(customer).data, status=status.HTTP_201_CREATED)
+
 
 
 class ProductViewSet(viewsets.ReadOnlyModelViewSet):

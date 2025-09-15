@@ -1,22 +1,22 @@
 # accounts/serializers.py
-from datetime import date,time as dtime,datetime as dt_datetime, time as dt_time
-from decimal import Decimal 
+from datetime import date, time as dtime, datetime as dt_datetime, time as dt_time
+from decimal import Decimal, ROUND_HALF_UP
 from django.utils import timezone  # type: ignore
-from django.db.models import Sum,Case,When, F, DecimalField # type: ignore
+from django.db.models import Sum, Case, When, F, DecimalField  # type: ignore
+from django.db.models.functions import Coalesce
 from rest_framework import serializers  # type: ignore
-
-from decimal import Decimal
-from rest_framework import serializers # type: ignore
-from .models import Product, StockIn
 
 from .models import (
     Account, CapitalTransaction, Expense, Product, Sale, SaleItem,
     StockIn, SalesCash, Customer, SalesCredit, Payable, PayablePayment
 )
 
+# ==========================
+# ACCOUNT
+# ==========================
 
 class AccountSerializer(serializers.ModelSerializer):
-    # FIX: let DRF read the model's @property full_name
+    # Let DRF read the model's @property full_name
     full_name = serializers.ReadOnlyField()
 
     class Meta:
@@ -24,15 +24,19 @@ class AccountSerializer(serializers.ModelSerializer):
         fields = ['id', 'first_name', 'middle_name', 'last_name', 'phone_number', 'pin', 'full_name']
 
 
-
-
-# ADD CAPITAL
+# ==========================
+# CAPITAL
+# ==========================
 
 class CapitalTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model = CapitalTransaction
         fields = '__all__'
 
+
+# ==========================
+# STOCK-IN (ADD PRODUCT / BATCH)
+# ==========================
 
 class AddProductStockInSerializer(serializers.Serializer):
     # incoming payload fields
@@ -55,18 +59,21 @@ class AddProductStockInSerializer(serializers.Serializer):
         normalized_name = validated_data['product_name'].strip().title()
         category = validated_data['category'].strip()
         quantity = int(validated_data['quantity'])
-        purchase_price = validated_data['purchase_price']
+        purchase_price: Decimal = validated_data['purchase_price']
         markup_rate = float(validated_data['markup_rate'])
         image = validated_data.get('image')
 
-        # 🔒 Per-account lookup
+        # Per-account lookup
         product = Product.objects.filter(
             account_id=account_id,
             product_name__iexact=normalized_name
         ).first()
 
         if not product:
-            selling_price = purchase_price * (Decimal(1) + Decimal(markup_rate) / Decimal(100))
+            # Compute selling price with proper Decimal math
+            selling_price = (purchase_price * (Decimal('1') + Decimal(str(markup_rate)) / Decimal('100')))\
+                .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
             product = Product.objects.create(
                 account_id=account_id,
                 product_name=normalized_name,
@@ -76,11 +83,15 @@ class AddProductStockInSerializer(serializers.Serializer):
             )
         else:
             # Keep category up to date, and set image if empty
+            update_fields = []
             if product.category != category:
                 product.category = category
+                update_fields.append('category')
             if (not product.image) and image:
                 product.image = image
-            product.save(update_fields=['category', 'image'] if image else ['category'])
+                update_fields.append('image')
+            if update_fields:
+                product.save(update_fields=update_fields)
 
         # Create StockIn tied to this account
         StockIn.objects.create(
@@ -96,9 +107,9 @@ class AddProductStockInSerializer(serializers.Serializer):
         return product
 
 
-
-
-
+# ==========================
+# SALES (CASH)
+# ==========================
 
 class SalesCashSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(write_only=True)
@@ -110,10 +121,11 @@ class SalesCashSerializer(serializers.ModelSerializer):
         fields = ['product_name', 'quantity', 'selling_price', 'or_num', 'sale', 'date']
 
     def create(self, validated_data):
-        from datetime import date  # local import to avoid global name clashes
+        from datetime import date as py_date
+
         product_name = validated_data.pop('product_name')
         quantity = int(validated_data.pop('quantity'))
-        selling_price = validated_data.pop('selling_price')
+        selling_price: Decimal = validated_data.pop('selling_price')
 
         # Look up product
         product = Product.objects.filter(product_name__iexact=product_name).first()
@@ -148,23 +160,30 @@ class SalesCashSerializer(serializers.ModelSerializer):
             batch.save(update_fields=['remaining_quantity'])
             q -= take
 
-        # IMPORTANT: amount should be total, not unit price
-        line_total = (selling_price * Decimal(quantity)).quantize(Decimal('0.01'))
+        # amount should be total, not unit price
+        line_total = (selling_price * Decimal(quantity)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
         sales_cash = SalesCash.objects.create(
             sale=sale,
             product=product,
             amount=line_total,
             quantity=quantity,
-            date=validated_data.get('date', date.today()),
+            date=validated_data.get('date', py_date.today()),
             or_num=validated_data.get('or_num', f"OR-{timezone.now().timestamp()}")
         )
         return sales_cash
 
 
+# ==========================
+# CUSTOMERS (for Utang list / creation)
+# ==========================
 
-# For Utang Add New Customer to the List
 class CustomerSerializer(serializers.ModelSerializer):
+    """
+    IMPORTANT:
+    In your current flow, you decrement `customer.credit_limit` when a new Utang is created.
+    That means `credit_limit` is already the *remaining* credit. So we just return it.
+    """
     remaining_credit = serializers.SerializerMethodField()
 
     class Meta:
@@ -175,18 +194,13 @@ class CustomerSerializer(serializers.ModelSerializer):
         ]
 
     def get_remaining_credit(self, obj):
-        # account scoping (pass account_id via serializer context from the view)
-        account_id = self.context.get('account_id')
-        qs = SalesCredit.objects.filter(customer=obj, status=0)
-        if account_id:
-            qs = qs.filter(account_id=account_id)
+        val = obj.credit_limit or Decimal('0')
+        return float(val)
 
-        total_unpaid = qs.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
 
-        # OPTION A (recommended label “Remaining credit”):
-        limit = obj.credit_limit or Decimal('0.00')
-        return float(limit - total_unpaid)
-
+# ==========================
+# SALE ITEMS (shared)
+# ==========================
 
 class SaleItemSerializer(serializers.ModelSerializer):
     class Meta:
@@ -194,6 +208,9 @@ class SaleItemSerializer(serializers.ModelSerializer):
         fields = ['stockin', 'quantity', 'unit_price']
 
 
+# ==========================
+# SALES CREDIT (Utang) – list/record
+# ==========================
 
 class SalesCreditRecordSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.product_name', read_only=True)
@@ -217,7 +234,20 @@ class SalesCreditRecordSerializer(serializers.ModelSerializer):
 
     def get_status(self, obj):
         return "Paid" if obj.status == 1 else "Unpaid"
-    
+
+# ===== Customers: write serializer to ensure account_id is saved =====
+class CustomerCreateSerializer(serializers.ModelSerializer):
+    # client must send this; snake_case
+    account_id = serializers.IntegerField(write_only=True, required=True)
+
+    class Meta:
+        model = Customer
+        fields = ['first_name', 'last_name', 'address', 'contact_num', 'credit_limit', 'account_id']
+
+    def create(self, validated_data):
+        account_id = validated_data.pop('account_id')
+        return Customer.objects.create(account_id=account_id, **validated_data)
+
 
 class SalesCreditCreateSerializer(serializers.Serializer):
     product_name = serializers.CharField()
@@ -235,7 +265,7 @@ class SalesCreditCreateSerializer(serializers.Serializer):
     def create(self, validated_data):
         product_name = validated_data.get('product_name')
         quantity = int(validated_data.get('quantity'))
-        selling_price = validated_data.get('selling_price')
+        selling_price: Decimal = validated_data.get('selling_price')
         customer_id = validated_data.get('customer_id')
         or_num = validated_data.get('or_num', f"OR-{timezone.now().timestamp()}")
         due_date = validated_data.get('due_date')
@@ -258,9 +288,11 @@ class SalesCreditCreateSerializer(serializers.Serializer):
         if total_available < quantity:
             raise serializers.ValidationError({'quantity': f"Only {total_available} items in stock"})
 
-        # Total charge (for credit limit check)
-        total_cost = selling_price * quantity
-        if customer.credit_limit < total_cost:
+        # Total charge (for credit limit check) – Decimal & 2dp
+        total_cost = (selling_price * Decimal(quantity)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        # Credit limit check: you treat credit_limit as remaining balance
+        if (customer.credit_limit or Decimal('0')) < total_cost:
             raise serializers.ValidationError({
                 'credit_limit': f"Insufficient credit limit. Remaining: {customer.credit_limit}"
             })
@@ -292,31 +324,35 @@ class SalesCreditCreateSerializer(serializers.Serializer):
             batch.save(update_fields=['remaining_quantity'])
             q -= take
 
-        # Create SalesCredit row (keeps your original 'amount' behavior)
+        # Create SalesCredit row
+        # Your current behavior: amount = unit price; subtotal = quantity * amount in serializer
         SalesCredit.objects.create(
             sale=sale,
             product=product,
             customer=customer,
-            amount=selling_price,         # keep your current behavior (unit). If you want TOTAL, change to selling_price * quantity
+            amount=selling_price,         # unit price stored
             quantity=quantity,
             status=0,
-            credit_date=date.today(),     # ← was dt_date.today()
+            credit_date=date.today(),
             paid_date=None,
             or_num=or_num,
             due_date=due_date,
         )
 
-        # Deduct customer credit_limit (you were doing this)
-        customer.credit_limit -= total_cost
+        # Deduct customer credit_limit (you are using it as remaining balance)
+        customer.credit_limit = (customer.credit_limit or Decimal('0')) - total_cost
         customer.save(update_fields=['credit_limit'])
 
         return {
             "sale_id": sale.id,
-            "remaining_credit": float(customer.credit_limit),
+            "remaining_credit": float(customer.credit_limit or Decimal('0')),
             "due_date": due_date
         }
 
-    
+
+# ==========================
+# DELETE / ADJUST INVENTORY
+# ==========================
 
 class DeleteInventorySerializer(serializers.Serializer):
     stockin_id = serializers.IntegerField()
@@ -326,6 +362,9 @@ class DeleteInventorySerializer(serializers.Serializer):
     account_id = serializers.IntegerField()
 
 
+# ==========================
+# STOCK-IN LISTING / BATCH INFO
+# ==========================
 
 class StockInBatchSerializer(serializers.ModelSerializer):
     stockin_date = serializers.DateTimeField(format='%Y-%m-%d', read_only=True)
@@ -337,19 +376,16 @@ class StockInBatchSerializer(serializers.ModelSerializer):
 
 
 class BatchSerializer(serializers.ModelSerializer):
-    created_at = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S")  # or your desired format
+    created_at = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S")
 
     class Meta:
-        model = StockIn  # or Batch
-        fields = ['id', 'product', 'remaining_quantity', 'purchase_price', 'created_at','markup_rate',]
+        model = StockIn
+        fields = ['id', 'product', 'remaining_quantity', 'purchase_price', 'created_at', 'markup_rate']
 
 
-    
-#New Add for AddSales 06-24-25
-
-# ✅ FIXED ProductSerializer
-
-# ✅ DROP-IN REPLACEMENT for ProductSerializer in accounts/serializers.py
+# ==========================
+# PRODUCT LISTING FOR APP (RecordSalesPage)
+# ==========================
 
 class ProductSerializer(serializers.ModelSerializer):
     quantity = serializers.SerializerMethodField()
@@ -359,21 +395,21 @@ class ProductSerializer(serializers.ModelSerializer):
     category = serializers.CharField(read_only=True)
 
     image_url = serializers.SerializerMethodField()
-    thumbnail_url = serializers.SerializerMethodField()  # ← NEW
+    thumbnail_url = serializers.SerializerMethodField()  # small image for list/grid
 
     class Meta:
         model = Product
         fields = [
             'id', 'product_name', 'category', 'quantity',
             'purchase_price', 'markup_rate', 'selling_price',
-            'image_url', 'thumbnail_url'  # ← include new field
+            'image_url', 'thumbnail_url'
         ]
 
     def get_quantity(self, obj):
         return int(
             StockIn.objects
             .filter(product=obj, account_id=obj.account_id)
-            .aggregate(total=Sum('remaining_quantity'))['total'] or 0
+            .aggregate(total=Coalesce(Sum('remaining_quantity'), 0))['total'] or 0
         )
 
     def _latest_stockin(self, obj):
@@ -395,10 +431,8 @@ class ProductSerializer(serializers.ModelSerializer):
     def get_selling_price(self, obj):
         si = self._latest_stockin(obj)
         if si:
-            return round(
-                si.purchase_price * (Decimal(1) + Decimal(si.markup_rate) / Decimal(100)),
-                2
-            )
+            return (si.purchase_price * (Decimal('1') + Decimal(str(si.markup_rate)) / Decimal('100')))\
+                .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         return Decimal("0.00")
 
     def get_image_url(self, obj):
@@ -426,20 +460,15 @@ class ProductSerializer(serializers.ModelSerializer):
         so the UI still shows something while you backfill thumbnails.
         """
         request = self.context.get('request')
-        # If the Product has a generated thumbnail, use it.
         if getattr(obj, 'thumbnail', None):
             url = obj.thumbnail.url if obj.thumbnail else None
             return request.build_absolute_uri(url) if (request and url) else url
-
-        # Fallback: reuse whatever get_image_url would return (may be large).
-        # This avoids breaking the UI before all thumbnails exist.
         return self.get_image_url(obj)
 
 
-
-
-
+# ==========================
 # EXPENSES
+# ==========================
 
 class ExpenseSerializer(serializers.ModelSerializer):
     class Meta:
@@ -447,7 +476,9 @@ class ExpenseSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
-# EDITING STOCK IN MISTAKE STOCK IN OR ETC
+# ==========================
+# EDITING STOCK-IN BATCH
+# ==========================
 
 class UpdateStockInSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.product_name', required=True)
@@ -481,9 +512,11 @@ class UpdateStockInSerializer(serializers.ModelSerializer):
         instance.save()
 
         return instance
-    
 
+
+# ==========================
 # UTANG / DEBTORS PAGE
+# ==========================
 
 class CreditItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.product_name')
@@ -494,7 +527,8 @@ class CreditItemSerializer(serializers.ModelSerializer):
         fields = ['product_name', 'quantity', 'subtotal']
 
     def get_subtotal(self, obj):
-        return obj.quantity * obj.amount
+        # amount is unit price in your current schema
+        return (Decimal(obj.quantity) * Decimal(obj.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
 class CreditTransactionSerializer(serializers.Serializer):
@@ -502,7 +536,9 @@ class CreditTransactionSerializer(serializers.Serializer):
     items = CreditItemSerializer(many=True)
 
 
-
+# ==========================
+# ACCOUNT NAME UTILITIES
+# ==========================
 
 class AccountNameSerializer(serializers.Serializer):
     first_name = serializers.CharField()
@@ -511,16 +547,20 @@ class AccountNameSerializer(serializers.Serializer):
     full_name = serializers.SerializerMethodField()
 
     def get_full_name(self, obj):
-        # Combine names with spaces, ignoring 'N/A' middle name if you want
         middle = '' if obj.middle_name == 'N/A' else f' {obj.middle_name} '
         return f"{obj.first_name}{middle}{obj.last_name}"
+
 
 class FullNameSecureUpdateSerializer(serializers.Serializer):
     pin = serializers.RegexField(regex=r'^\d{4}$', max_length=4)
     first_name = serializers.CharField(max_length=100)
-    middle_name = serializers.CharField(max_length=50, required=False, allow_blank=True)    
+    middle_name = serializers.CharField(max_length=50, required=False, allow_blank=True)
     last_name = serializers.CharField(max_length=100)
 
+
+# ==========================
+# PAYABLES
+# ==========================
 
 class PayableSerializer(serializers.ModelSerializer):
     class Meta:
@@ -531,7 +571,8 @@ class PayableSerializer(serializers.ModelSerializer):
             'due_date', 'note', 'is_paid',
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+    read_only_fields = ['id', 'created_at', 'updated_at']
+
 
 class PayableCreateSerializer(serializers.ModelSerializer):
     class Meta:
@@ -544,8 +585,6 @@ class PayableCreateSerializer(serializers.ModelSerializer):
         p.is_paid = (p.remaining_amount == 0)
         p.save()
         return p
-
-# accounts/serializers.py (replace ONLY PayablePaymentSerializer)
 
 
 class PayablePaymentSerializer(serializers.ModelSerializer):
@@ -574,8 +613,6 @@ class PayablePaymentSerializer(serializers.ModelSerializer):
         return attrs
 
     def _compute_cash_balance(self, account_id=None):
-        # Inline helper so you don’t need utils.py
-        from .models import CapitalTransaction
         qs = CapitalTransaction.objects.all()
         if account_id:
             qs = qs.filter(account_id=account_id)
@@ -591,19 +628,17 @@ class PayablePaymentSerializer(serializers.ModelSerializer):
         )['bal'] or 0)
 
     def create(self, validated_data):
-        from .models import CapitalTransaction
-
         # Pop write-only extras
         item_label = (validated_data.pop('item_label', '') or '').strip()
 
         # 1) Create the payment
         payment = super().create(validated_data)
 
-        # 2) Update the payable (already handled in your current create, kept here)
+        # 2) Update the payable
         p = payment.payable
         p.remaining_amount = p.remaining_amount - payment.amount
         if p.remaining_amount <= 0:
-            p.remaining_amount = 0
+            p.remaining_amount = Decimal('0.00')
             p.is_paid = True
         p.save(update_fields=['remaining_amount', 'is_paid', 'updated_at'])
 
@@ -613,7 +648,7 @@ class PayablePaymentSerializer(serializers.ModelSerializer):
         pay_dt = dt_datetime.combine(payment.date, dt_time.min)
 
         tx = CapitalTransaction.objects.create(
-            account=p.account,     # or account_id=p.account_id (both OK if FK field is 'account')
+            account=p.account,
             amount=payment.amount,
             transaction_type='withdraw',
             remarks=f"Payment - {label}",
@@ -638,7 +673,6 @@ class PayablePaymentSerializer(serializers.ModelSerializer):
         # Small preview block for client UI
         tx = getattr(self, '_tx', None)
         if not tx:
-            # Best effort fallback if serializer is used for read without recent create
             return {
                 "type": "withdraw",
                 "amount": float(obj.amount),
@@ -652,5 +686,3 @@ class PayablePaymentSerializer(serializers.ModelSerializer):
             "description": tx.remarks or "",
             "date": tx.date.isoformat()
         }
-
-
