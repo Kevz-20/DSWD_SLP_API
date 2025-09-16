@@ -447,16 +447,16 @@ def record_sale(request):
       "account_id": 12,
       "or_num": "OR123" (optional),
       "products": [
-        {"product_id": 5, "quantity": 2}      // prefer product_id
+        {"product_id": 5, "quantity": 2}
         // or {"product_name": "Coke", "quantity": 2}
       ],
       "customer_data": {
         "id": 99 (optional if existing),
         "first_name": "...",
         "last_name": "...",
-        "contact_num": "...",   // required if creating
+        "contact_num": "...",
         "address": "...",
-        "due_date": "YYYY-MM-DD"  // required for utang (optional if you allow open)
+        "due_date": "YYYY-MM-DD"
       }
     }
     """
@@ -488,37 +488,40 @@ def record_sale(request):
             except ValueError:
                 return Response({'error': 'Invalid due_date format. Use YYYY-MM-DD.'}, status=400)
 
+    # Ensure this is set for all code paths (cash/utang)
+    remaining_credit = None
+
     with transaction.atomic():
         # Step 1: Load/create customer if UTANG
         customer = None
-    if sale_type == 'utang':
-        if not customer_data:
-            return Response({'error': 'customer_data required for utang sale'}, status=400)
+        if sale_type == 'utang':
+            if not customer_data:
+                return Response({'error': 'customer_data required for utang sale'}, status=400)
 
-        customer_id = customer_data.get('id')
-        if customer_id:
-            try:
-                customer = Customer.objects.get(id=customer_id, account_id=account_id)  # scoped to account
-            except Customer.DoesNotExist:
-                return Response({'error': 'Customer not found with given ID for this account'}, status=400)
-        else:
-            first_name = (customer_data.get('first_name') or '').strip() or 'Unknown'
-            last_name  = (customer_data.get('last_name')  or '').strip() or 'Unknown'
-            contact    = (customer_data.get('contact_num') or '').strip()
-            address    = (customer_data.get('address') or '').strip()
-            if not contact:
-                return Response({'error': 'contact_num is required to create a new customer'}, status=400)
+            customer_id = customer_data.get('id')
+            if customer_id:
+                try:
+                    customer = Customer.objects.get(id=customer_id, account_id=account_id)  # scoped to account
+                except Customer.DoesNotExist:
+                    return Response({'error': 'Customer not found with given ID for this account'}, status=400)
+            else:
+                first_name = (customer_data.get('first_name') or '').strip() or 'Unknown'
+                last_name  = (customer_data.get('last_name')  or '').strip() or 'Unknown'
+                contact    = (customer_data.get('contact_num') or '').strip()
+                address    = (customer_data.get('address') or '').strip()
+                if not contact:
+                    return Response({'error': 'contact_num is required to create a new customer'}, status=400)
 
-            # Try to reuse an existing customer under the SAME account
-            customer = Customer.objects.filter(contact_num__iexact=contact, account_id=account_id).first()
-            if not customer:
-                customer = Customer.objects.create(
-                    account_id=account_id,   # <- IMPORTANT
-                    first_name=first_name,
-                    last_name=last_name,
-                    address=address,
-                    contact_num=contact
-                )
+                # Try to reuse an existing customer under the SAME account
+                customer = Customer.objects.filter(contact_num__iexact=contact, account_id=account_id).first()
+                if not customer:
+                    customer = Customer.objects.create(
+                        account_id=account_id,
+                        first_name=first_name,
+                        last_name=last_name,
+                        address=address,
+                        contact_num=contact
+                    )
 
         # Step 2: Prepare products and validate stock (per-account + FIFO)
         product_rows = []  # [(product, qty, [batches])]
@@ -574,9 +577,21 @@ def record_sale(request):
                     simulated_total += (unit * take)
                     needed -= take
 
-            if customer.credit_limit < simulated_total:
+            # Compute remaining credit (limit minus existing unpaid)
+            existing_unpaid = (
+                SalesCredit.objects
+                .filter(customer=customer, status=0, account_id=account_id)
+                .aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+            )
+            credit_limit = Decimal(str(customer.credit_limit or 0))
+            remaining_limit = credit_limit - existing_unpaid
+
+            if simulated_total > remaining_limit:
                 return Response({
-                    'error': f"Insufficient credit. Remaining: ₱{customer.credit_limit:,.2f}, Required: ₱{simulated_total:,.2f}"
+                    'error': (
+                        f"Insufficient credit. Remaining: ₱{remaining_limit:,.2f}, "
+                        f"Required: ₱{simulated_total:,.2f}"
+                    )
                 }, status=400)
 
         # Step 4: Create sales, deduct stock FIFO, create SalesCash / SalesCredit + capital
@@ -645,7 +660,6 @@ def record_sale(request):
                 remaining -= take
 
         # Step 5: For utang, compute remaining credit for UX
-        remaining_credit = None
         if sale_type == 'utang' and customer:
             total_unpaid = (
                 SalesCredit.objects
@@ -654,10 +668,12 @@ def record_sale(request):
             )
             remaining_credit = float(customer.credit_limit - total_unpaid)
 
+    # outside the transaction: build response
     return Response({
         'message': 'All sales recorded successfully',
-        'remaining_credit': remaining_credit
+        'remaining_credit': remaining_credit  # None for cash, float for utang
     }, status=201)
+
 
 
 

@@ -180,9 +180,7 @@ class SalesCashSerializer(serializers.ModelSerializer):
 
 class CustomerSerializer(serializers.ModelSerializer):
     """
-    IMPORTANT:
-    In your current flow, you decrement `customer.credit_limit` when a new Utang is created.
-    That means `credit_limit` is already the *remaining* credit. So we just return it.
+    remaining_credit = credit_limit - sum(unpaid SalesCredit.amount) for THIS account.
     """
     remaining_credit = serializers.SerializerMethodField()
 
@@ -194,8 +192,24 @@ class CustomerSerializer(serializers.ModelSerializer):
         ]
 
     def get_remaining_credit(self, obj):
-        val = obj.credit_limit or Decimal('0')
-        return float(val)
+        # Prefer account_id from context (views set this),
+        # otherwise fall back to the customer's own account_id.
+        account_id = (
+            self.context.get('account_id')
+            or self.context.get('account')
+            or getattr(obj, 'account_id', None)
+        )
+
+        qs = SalesCredit.objects.filter(customer=obj, status=0)
+        if account_id:
+            qs = qs.filter(account_id=account_id)
+
+        total_unpaid = qs.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        limit = Decimal(str(obj.credit_limit or 0))
+        remaining = limit - total_unpaid
+        if remaining < 0:
+            remaining = Decimal('0.00')
+        return float(remaining)
 
 
 # ==========================
