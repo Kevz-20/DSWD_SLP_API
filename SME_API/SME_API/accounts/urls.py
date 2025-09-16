@@ -38,6 +38,9 @@ urlpatterns = [
     path('batches/', views.get_batches_by_product_name, name='get_batches_by_product_name'),
 
 
+    path('categories/', views.categories_list, name='categories_list'),
+    path('product/<int:product_id>/category/', views.update_product_category, name='update_product_category'),
+
     #Capital
     path('capital/', CapitalTransactionListCreateView.as_view(), name='capital-transactions'),
     path('capital/balance/', views.get_current_capital_balance),

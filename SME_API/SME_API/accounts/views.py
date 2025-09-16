@@ -26,6 +26,7 @@ from rest_framework.permissions import AllowAny
 from django.http import HttpResponse
 from .reporting import build_journal
 from .pdf_ledger import render_ledger_pdf
+from django.db.models.functions import Lower
 
 
 
@@ -1678,3 +1679,26 @@ def ledger_pdf(request):
     resp = HttpResponse(pdf, content_type="application/pdf")
     resp["Content-Disposition"] = 'inline; filename="ledger.pdf"'
     return resp
+
+
+@api_view(['GET'])
+def categories_list(request):
+    """
+    GET /api/categories/?account=12
+    Returns a case-insensitive, distinct, sorted list of non-empty categories
+    for the given account.
+    """
+    account = request.GET.get('account') or request.GET.get('account_id')
+    if not account:
+        return Response({'error': 'account is required'}, status=400)
+
+    qs = (Product.objects
+          .filter(account_id=account)
+          .exclude(category__isnull=True)
+          .exclude(category__exact='')
+          .order_by(Lower('category'))
+          .values_list('category', flat=True)
+          .distinct())
+
+    return Response(list(qs), status=200)
+
