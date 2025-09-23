@@ -160,7 +160,7 @@ class Expense(models.Model):
 
     account = models.ForeignKey(Account, on_delete=models.CASCADE)
     product = models.ForeignKey(Product, on_delete=models.SET_NULL, null=True, blank=True)
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)    # ⬅️ choices (optional)
     description = models.TextField(blank=True, null=True)                   # ⬅️ allow blank
     receipt = models.ImageField(upload_to='receipts/', blank=True, null=True)
