@@ -589,15 +589,43 @@ class PayableSerializer(serializers.ModelSerializer):
 
 
 class PayableCreateSerializer(serializers.ModelSerializer):
+    # extra field for downpayment
+    downpayment = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, default=0
+    )
+
     class Meta:
         model = Payable
-        fields = ['account', 'supplier_name', 'original_amount', 'due_date', 'note']
+        fields = ['account', 'supplier_name', 'original_amount',
+                  'due_date', 'note', 'downpayment']
 
     def create(self, validated_data):
+        # pop downpayment if present
+        down = validated_data.pop('downpayment', 0) or 0
         p = Payable(**validated_data)
-        p.remaining_amount = p.original_amount
-        p.is_paid = (p.remaining_amount == 0)
+
+        # compute remaining balance
+        p.remaining_amount = p.original_amount - down
+        if p.remaining_amount <= 0:
+            p.remaining_amount = Decimal('0.00')
+            p.is_paid = True
         p.save()
+
+        # If downpayment > 0 → create a PayablePayment + CapitalTransaction
+        if down > 0:
+            PayablePayment.objects.create(
+                payable=p,
+                amount=down,
+                date=date.today(),
+                note="Downpayment"
+            )
+            CapitalTransaction.objects.create(
+                account=p.account,
+                transaction_type="withdraw",
+                amount=down,
+                remarks=f"Downpayment for {p.supplier_name} ({p.note})"
+            )
+
         return p
 
 

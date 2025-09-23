@@ -64,6 +64,6 @@ urlpatterns = [
     path('reports/ledger.pdf', ledger_pdf, name='ledger-pdf'),
 
     #Account Payable
-    path('payables/summary/', views.payables_summary),
+    path('payables/summary/', views.payables_summary, name="payables_summary"),
     path('', include(router.urls)),  # type: ignore
 ]

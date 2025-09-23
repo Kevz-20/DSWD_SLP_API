@@ -1072,13 +1072,12 @@ def update_full_name_secure(request, phone_number):
     return Response({"message": "Full name updated.",
                      "full_name": account.full_name}, status=200)
 
-
-# 08-27-2025 ------------------------------------------------------------------------------------------------------------------------------------
+#----JESEL UPDATE 0923
 @api_view(['GET'])
 def transactions_list(request):
     """
     GET /api/transactions/?account=12&start=YYYY-MM-DD&end=YYYY-MM-DD&filter=all|sales|expenses
-    Newest-first across Cash Sales, Credit (Utang), Customer Payments, Payable Payments, and Expenses.
+    Newest-first across Cash Sales, Credit (Utang), Customer Payments, Payable Payments, Expenses, and Capital Movements.
     """
     from decimal import ROUND_HALF_UP
     account_id = request.GET.get("account") or request.GET.get("account_id")
@@ -1101,7 +1100,7 @@ def transactions_list(request):
 
     cash_list = []
     for sc in cash_qs:
-        sort_dt = sc.created_at  # full datetime
+        sort_dt = sc.created_at
         desc = f"{sc.product.product_name} ({sc.quantity} pcs)" if sc.product_id else "Sale"
         cash_list.append({
             "type": "sale",
@@ -1127,7 +1126,7 @@ def transactions_list(request):
 
     credit_list = []
     for cr in credit_qs:
-        line_total = float(cr.amount or 0)  # remaining balance (mutable)
+        line_total = float(cr.amount or 0)
         base = f"{cr.product.product_name} ({cr.quantity} pcs)" if cr.product_id else "Utang Sale"
         desc = f"{base} (Paid)" if cr.status == 1 else f"{base} (Unpaid)"
         sort_dt = cr.created_at
@@ -1211,10 +1210,10 @@ def transactions_list(request):
             "_seq": e.id,
         })
 
-    # -------------------- CUSTOMER PAYMENTS (from CapitalTransaction) --------------------
+    # -------------------- CUSTOMER PAYMENTS (subset of CapitalTransaction) --------------------
     pay_qs = CapitalTransaction.objects.filter(
         transaction_type='deposit',
-        remarks__icontains='Customer payment'  # created by apply_customer_payment
+        remarks__icontains='Customer payment'
     )
     if account_id:
         pay_qs = pay_qs.filter(account_id=account_id)
@@ -1226,9 +1225,9 @@ def transactions_list(request):
 
     payments_list = []
     for ct in pay_qs:
-        sort_dt = ct.date  # DateTimeField (default=timezone.now) -> full datetime
+        sort_dt = ct.date
         payments_list.append({
-            "type": "sale",                    # so filter=sales includes it
+            "type": "sale",
             "category": "Customer Payment",
             "description": ct.remarks or "Customer payment",
             "amount": float(ct.amount),
@@ -1239,7 +1238,7 @@ def transactions_list(request):
             "_seq": ct.id,
         })
 
-    # -------------------- PAYABLE PAYMENTS (use PayablePayment.created_at) --------------------
+    # -------------------- PAYABLE PAYMENTS --------------------
     pp_qs = PayablePayment.objects.select_related('payable')
     if account_id:
         pp_qs = pp_qs.filter(payable__account_id=account_id)
@@ -1251,7 +1250,7 @@ def transactions_list(request):
 
     payable_payments_list = []
     for pp in pp_qs:
-        sort_dt = pp.created_at  # full timestamp (auto_now_add)
+        sort_dt = pp.created_at
         payable_payments_list.append({
             "type": "expense",
             "category": "Payable Payment",
@@ -1264,14 +1263,55 @@ def transactions_list(request):
             "_seq": pp.id,
         })
 
+    # -------------------- CAPITAL MOVEMENTS (all deposits/withdraws) --------------------
+    cap_qs = CapitalTransaction.objects.all()
+    if account_id:
+        cap_qs = cap_qs.filter(account_id=account_id)
+    if start:
+        cap_qs = cap_qs.filter(date__date__gte=start)
+    if end:
+        cap_qs = cap_qs.filter(date__date__lte=end)
+    cap_qs = cap_qs.order_by('-date', '-id')
+
+    capital_list = []
+    for ct in cap_qs:
+        sort_dt = ct.date
+
+        if ct.transaction_type == "deposit":
+            sign = "+"
+        else:  # withdraw
+            sign = "-"
+
+        capital_list.append({
+            "type": "capital",  
+            "category": "Capital",
+            "description": ct.remarks or f"Capital {ct.transaction_type}",
+            "amount": float(ct.amount),
+            "sign": sign,                        
+            "payment_method": ct.transaction_type,
+            "date": sort_dt.isoformat(),
+            "occurred_at": sort_dt.isoformat(),
+            "_sort_dt": sort_dt.timestamp(),
+            "_seq": ct.id,
+        })
+        
     # -------------------- MERGE + FILTER + SORT --------------------
-    combined = cash_list + credit_list + payments_list + payable_payments_list + expenses_list
+    combined = (
+        cash_list
+        + credit_list
+        + payments_list
+        + payable_payments_list
+        + expenses_list
+        + capital_list
+    )
 
     if filt == "sales":
         combined = [x for x in combined if x["type"] == "sale"]
     elif filt == "expenses":
         combined = [x for x in combined if x["type"] == "expense"]
-
+    elif filt == "capital":
+        combined = [x for x in combined if x["category"] == "Capital"] 
+    
     combined.sort(key=lambda x: (x["_sort_dt"], x["_seq"]), reverse=True)
 
     for x in combined:
@@ -1491,21 +1531,28 @@ class PayableViewSet(viewsets.ModelViewSet):
         payable.save(update_fields=['remaining_amount', 'is_paid', 'updated_at'])
         return Response(PayableSerializer(payable).data)
 
-    @action(detail=True, methods=['POST']) # type: ignore
+    @action(detail=True, methods=['POST'])
     def record_payment(self, request, pk=None):
-        """
-        Body: { "amount": 500.00, "date": "2025-09-01", "note": "OR#123" }
-        """
         payable = self.get_object()
         payload = request.data.copy()
         payload['payable'] = payable.id
 
-        ser = PayablePaymentSerializer(data=payload)
-        ser.is_valid(raise_exception=True)
-        ser.save()  # updates payable remaining_amount/is_paid in serializer
+        with transaction.atomic():  # ✅ wrap in atomic
+            ser = PayablePaymentSerializer(data=payload)
+            ser.is_valid(raise_exception=True)
+            payment = ser.save()
 
-        payable.refresh_from_db()
-        return Response(PayableSerializer(payable).data, status=status.HTTP_201_CREATED)
+            CapitalTransaction.objects.create(
+                account=payable.account,
+                transaction_type="withdraw",
+                amount=Decimal(payment.amount),
+                remarks=f"Downpayment for {payable.supplier_name} ({payable.note})"
+            )
+
+            payable.refresh_from_db()
+
+        return Response(PayablePaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
+
 
 
 # Summary chips endpoint (function-based for simplicity)
