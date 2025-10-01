@@ -385,7 +385,7 @@ def record_expense(request):
         # Get account
         account = Account.objects.get(id=account_id)
 
-        # Create Expense record
+        # ✅ Record only as Expense (no CapitalTransaction mirror)
         Expense.objects.create(
             account=account,
             amount=amount,
@@ -394,15 +394,7 @@ def record_expense(request):
             receipt=receipt
         )
 
-        # Deduct from capital
-        CapitalTransaction.objects.create(
-            account_id=account.id,  # 08-27-2025-------------------------------------------------------------------------------------------------
-            amount=amount,
-            transaction_type='withdraw',
-            remarks=f"Expense: {category} - {description}"
-        )
-
-        return Response({'message': 'Expense recorded and capital deducted.'}, status=status.HTTP_201_CREATED)
+        return Response({'message': 'Expense recorded successfully.'}, status=status.HTTP_201_CREATED)
 
     except Account.DoesNotExist:
         return Response({'error': 'Account not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -1084,10 +1076,11 @@ def update_full_name_secure(request, phone_number):
                      "full_name": account.full_name}, status=200)
 
 #----JESEL UPDATE 0923
+#---- TRANSACTION HISTORY API ----
 @api_view(['GET'])
 def transactions_list(request):
     """
-    GET /api/transactions/?account=12&start=YYYY-MM-DD&end=YYYY-MM-DD&filter=all|sales|expenses
+    GET /api/transactions/?account=12&start=YYYY-MM-DD&end=YYYY-MM-DD&filter=all|sales|expenses|capital
     Newest-first across Cash Sales, Credit (Utang), Customer Payments, Payable Payments, Expenses, and Capital Movements.
     """
     from decimal import ROUND_HALF_UP
@@ -1137,13 +1130,12 @@ def transactions_list(request):
 
     credit_list = []
     for cr in credit_qs:
-        # Get original line total from SaleItem (not the mutable SalesCredit.amount)
         try:
             items = SaleItem.objects.filter(sale_id=cr.sale_id, stockin__product_id=cr.product_id)
             total_val = sum((i.unit_price or 0) * (i.quantity or 0) for i in items)
             line_total = float(total_val)
         except Exception:
-            line_total = float(cr.amount or 0)  # fallback
+            line_total = float(cr.amount or 0)
 
         base = f"{cr.product.product_name} ({cr.quantity} pcs)" if cr.product_id else "Utang Sale"
         desc = f"{base} (Paid)" if cr.status == 1 else f"{base} (Unpaid)"
@@ -1153,14 +1145,13 @@ def transactions_list(request):
             "type": "sale",
             "category": "Sale",
             "description": desc,
-            "amount": line_total,   # ✅ now always shows original sale amount
+            "amount": line_total,
             "payment_method": "Utang",
             "date": sort_dt.isoformat(),
             "occurred_at": sort_dt.isoformat(),
             "_sort_dt": sort_dt.timestamp(),
             "_seq": cr.id,
         })
-
 
     # -------------------- EXPENSES --------------------
     exp_qs = Expense.objects.select_related("product")
@@ -1173,32 +1164,6 @@ def transactions_list(request):
     exp_qs = exp_qs.order_by("-created_at", "-id")
 
     expenses_list = []
-
-    def _match_stockin_qty_for_expense(e):
-        if not e.product_id:
-            return None
-        si_qs = StockIn.objects.filter(product_id=e.product_id)
-        if account_id:
-            si_qs = si_qs.filter(account_id=account_id)
-        si_qs = si_qs.filter(created_at__date=e.created_at.date()).select_related("product")
-        if not si_qs.exists():
-            latest = StockIn.objects.filter(product_id=e.product_id).order_by("-created_at").first()
-            if latest and latest.purchase_price:
-                try:
-                    return int(Decimal(e.amount) / Decimal(latest.purchase_price))
-                except Exception:
-                    return None
-            return None
-        amt = Decimal(e.amount or 0).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        for si in si_qs:
-            total = (Decimal(si.quantity) * Decimal(si.purchase_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            if abs(total - amt) <= Decimal("0.01"):
-                return si.quantity
-        si_list = list(si_qs)
-        si_list.sort(key=lambda si: abs((Decimal(si.quantity) * Decimal(si.purchase_price)) - amt))
-        best = si_list[0] if si_list else None
-        return best.quantity if best else None
-
     for e in exp_qs:
         is_stockin = (
             (e.category == Expense.INVENTORY_PURCHASE)
@@ -1209,11 +1174,7 @@ def transactions_list(request):
 
         if e.product_id:
             name = e.product.product_name
-            if is_stockin:
-                qty = getattr(e, "quantity", None) or _match_stockin_qty_for_expense(e)
-                desc = f"{name} ({qty} pcs)" if qty else name
-            else:
-                desc = e.description or name
+            desc = f"{name}" if not is_stockin else f"{name} ({e.quantity or ''} pcs)"
         else:
             desc = e.description or e.category or "Expense"
 
@@ -1230,7 +1191,7 @@ def transactions_list(request):
             "_seq": e.id,
         })
 
-    # -------------------- CUSTOMER PAYMENTS (subset of CapitalTransaction) --------------------
+    # -------------------- CUSTOMER PAYMENTS (Capital deposits) --------------------
     pay_qs = CapitalTransaction.objects.filter(
         transaction_type='deposit',
         remarks__icontains='Customer payment'
@@ -1283,7 +1244,7 @@ def transactions_list(request):
             "_seq": pp.id,
         })
 
-    # -------------------- CAPITAL MOVEMENTS (all deposits/withdraws) --------------------
+    # -------------------- CAPITAL MOVEMENTS --------------------
     cap_qs = CapitalTransaction.objects.all()
     if account_id:
         cap_qs = cap_qs.filter(account_id=account_id)
@@ -1297,13 +1258,16 @@ def transactions_list(request):
     for ct in cap_qs:
         sort_dt = ct.date
 
-        # 🚨 Prevent duplicate Downpayment showing under Capital
-        if ct.remarks and "downpayment" in ct.remarks.lower():
-            continue  # handled already under PayablePayment (Expense)
+        # 🚨 Skip downpayments here → they are already shown under Payable Payments (expense)
+        if ct.remarks:
+            rm = ct.remarks.lower()
+            if "downpayment" in rm or "down payment" in rm or rm.startswith("dp"):
+                continue
+
 
         if ct.transaction_type == "deposit":
             sign = "+"
-        else:  # withdraw
+        else:  
             sign = "-"
 
         capital_list.append({
@@ -1319,7 +1283,7 @@ def transactions_list(request):
             "_seq": ct.id,
         })
 
-# -------------------- MERGE + FILTER + SORT --------------------
+    # -------------------- MERGE + FILTER + SORT --------------------
     combined = (
         cash_list
         + credit_list
@@ -1342,8 +1306,6 @@ def transactions_list(request):
         x.pop("_sort_dt", None)
 
     return Response(combined)
-
-
 
 # JESEL UPDATE --------------------------------------------------------------------------------------------------------------------------------
 @api_view(['GET'])
@@ -1618,14 +1580,7 @@ class PayableViewSet(viewsets.ModelViewSet):
         with transaction.atomic():  # ✅ wrap in atomic
             ser = PayablePaymentSerializer(data=payload)
             ser.is_valid(raise_exception=True)
-            payment = ser.save()
-
-            CapitalTransaction.objects.create(
-                account=payable.account,
-                transaction_type="withdraw",
-                amount=Decimal(payment.amount),
-                remarks=f"Downpayment for {payable.supplier_name} ({payable.note})"
-            )
+            payment = ser.save()        
 
             payable.refresh_from_db()
 
