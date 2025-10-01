@@ -192,21 +192,20 @@ def inventory_list(request):
 
 # THIS VIEW FOR LIST OF ALL PRODUCT ( RECORD SALES ) -----------------------------------------------------------------------------------------------------------------------------
 # GET /api/products/?account_id=12&search=co
+# GET /api/products/?account_id=12&search=co
+# views.py
 @api_view(['GET'])
 def product_list(request):
-    account_id = request.GET.get('account_id')
-    keyword = request.GET.get('search', '')
+    account_id = _require_account_id(request)
+    keyword = (request.GET.get('search') or '').strip()
 
-    products = Product.objects.all()
-    if account_id:
-        products = products.filter(account_id=account_id)
+    qs = Product.objects.filter(account_id=account_id)
     if keyword:
-        products = products.filter(product_name__icontains=keyword)
+        qs = qs.filter(product_name__icontains=keyword)
 
-    serializer = ProductSerializer(products.order_by('product_name'), many=True)
-    return Response(serializer.data, status=200)
-
-
+    data = ProductSerializer(qs.order_by('product_name'), many=True).data
+    print(f"[DBG] products count={len(data)} for account_id={account_id}, search='{keyword}'")
+    return Response(data, status=200)
 
 # THIS VIEW FOR MANAGE INVENTORY PAGE ( MANAGE INVENTORY ) ----------------------------------------------------------------------------------------------------------------------
 # GET /api/manage-inventory/?account_id=12
@@ -257,7 +256,6 @@ def manage_inventory_view(request):
 
     return Response(inventory_data)
 
-
 @api_view(['PUT'])
 def update_product_category(request, product_id):
     account_id = _require_account_id(request)
@@ -273,7 +271,6 @@ def update_product_category(request, product_id):
         return Response({'message': 'Product category updated successfully'}, status=200)
 
     return Response({'error': 'No valid category provided'}, status=400)
-
 
     
 # THIS VIEW FOR DELETING PRODUCT EXPIRED OR DAMAGE ( MANAGE INVENTORY ) ----------------------------------------------------------------------------------------------------------------
@@ -322,8 +319,6 @@ def delete_inventory(request):
     )
 
     return Response({'message': 'Deleted quantity from batch and recorded expense.'}, status=status.HTTP_200_OK)
-
-
 
 
 # THIS VIEW FOR RECORD EXPENSES BILLS, UTILITIES ETC ( RECORD EXPENSES ) ---------------------------------------------------------------------------------------------------------------
@@ -377,9 +372,7 @@ def list_expenses(request):
     return Response(ExpenseSerializer(expenses, many=True).data)
 
 
-
 # FOR RECORD SALE PAGE
-
 
 
 from .models import (
@@ -1230,36 +1223,51 @@ def customer_debts(request, customer_id: int):
     return resp
 
 
+from decimal import Decimal, ROUND_HALF_UP
+from django.db import transaction
+from django.utils import timezone
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from rest_framework import status
+
+from .models import SalesCredit, CapitalTransaction
+
+
 @api_view(['POST'])
 def apply_customer_payment(request, customer_id: int):
     """
     Applies a payment to a customer's outstanding SalesCredit for the given account.
-    Oldest dues first (due_date, then credit_date, then id).
-    Deducts from the remaining per-line amount (SalesCredit.amount = remaining balance).
+    Allocates oldest dues first (due_date, then credit_date, then id).
+    Deducts from remaining per-line amount (SalesCredit.amount = remaining balance).
+    Creates a CapitalTransaction entry for the applied amount.
     """
+
     # ---- validate amount ----
     try:
         amt = Decimal(str(request.data.get('amount', 0))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     except Exception:
-        return Response({'error': 'Invalid amount'}, status=400)
+        return Response({'error': 'Invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
 
     if amt <= 0:
-        return Response({'error': 'Amount must be > 0'}, status=400)
+        return Response({'error': 'Amount must be > 0'}, status=status.HTTP_400_BAD_REQUEST)
 
     # ---- validate account ----
-    account_id = request.data.get('account_id')
-    if not account_id:
-        return Response({'error': 'account_id is required'}, status=400)
+    raw_account_id = request.data.get('account_id')
+    try:
+        account_id = int(raw_account_id)
+    except (TypeError, ValueError):
+        return Response({'error': 'account_id is required and must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ---- fetch credits with remaining balance ----
-    qs = (SalesCredit.objects
-          .filter(customer_id=customer_id, account_id=account_id, amount__gt=0)
-          .order_by('due_date', 'credit_date', 'id'))
+    # ---- fetch open credits ----
+    qs = (
+        SalesCredit.objects
+        .filter(customer_id=customer_id, account_id=account_id, amount__gt=0)
+        .order_by('due_date', 'credit_date', 'id')
+    )
 
     remaining_amt = amt
     allocations = []
 
-    # ---- atomic + locking to prevent concurrent double-apply ----
     with transaction.atomic():
         locked = list(qs.select_for_update())
 
@@ -1272,10 +1280,9 @@ def apply_customer_payment(request, customer_id: int):
                 continue
 
             applied = min(line_remaining, remaining_amt)
-
             new_remaining = (line_remaining - applied).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
-            # 🔒 Clamp tiny residuals to 0.00 to avoid "-0.00" or 0.009999
+            # Clamp tiny residuals
             if new_remaining < Decimal('0.005'):
                 new_remaining = Decimal('0.00')
 
@@ -1283,8 +1290,8 @@ def apply_customer_payment(request, customer_id: int):
 
             if new_remaining <= 0:
                 sc.status = SalesCredit.CreditStatus.PAID
-                # sc.paid_date = timezone.now().date()
-                update_fields = ['amount', 'status']  # + 'paid_date' if used
+                sc.paid_date = timezone.now().date()
+                update_fields = ['amount', 'status', 'paid_date']
             elif applied > 0:
                 sc.status = SalesCredit.CreditStatus.PARTIAL
                 update_fields = ['amount', 'status']
@@ -1302,8 +1309,21 @@ def apply_customer_payment(request, customer_id: int):
 
             remaining_amt = (remaining_amt - applied).quantize(Decimal('0.01'))
 
+        applied_total = amt - remaining_amt
+        if applied_total <= 0:
+            return Response({'error': 'No open balances to apply this payment.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # ---- log into CapitalTransaction ----
+        CapitalTransaction.objects.create(
+            account_id=account_id,
+            amount=applied_total,
+            transaction_type='deposit',
+            remarks=f'Customer payment (customer_id={customer_id}, account_id={account_id})'
+        )
+
     return Response({
         'allocations': allocations,
-        'applied_total': float(amt - remaining_amt),
+        'applied_total': float(applied_total),
         'unapplied_balance': float(remaining_amt),
-    }, status=200)
+    }, status=status.HTTP_200_OK)
+
