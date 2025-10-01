@@ -243,18 +243,23 @@ class Customer(models.Model):
 
 # ----------------- SALES CREDIT -----------------
 class SalesCredit(models.Model):
-    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)
-    sale = models.ForeignKey(Sale, on_delete=models.CASCADE)
-    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    class CreditStatus(models.IntegerChoices):
+        UNPAID  = 0, "Unpaid"
+        PARTIAL = 1, "Partially Paid"
+        PAID    = 2, "Paid"
+
+    account  = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True) 
+    sale     = models.ForeignKey(Sale, on_delete=models.CASCADE)
+    product  = models.ForeignKey(Product, on_delete=models.CASCADE)
     customer = models.ForeignKey(Customer, on_delete=models.CASCADE)
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    amount   = models.DecimalField(max_digits=10, decimal_places=2)
     quantity = models.IntegerField(default=1)
-    status = models.IntegerField()  # 1 = paid, 0 = unpaid
+    status   = models.IntegerField(choices=CreditStatus.choices, default=CreditStatus.UNPAID)
     credit_date = models.DateField()
-    paid_date = models.DateField(null=True, blank=True)
-    or_num = models.CharField(max_length=50)
-    due_date = models.DateField(null=True, blank=True)  # ✅ ADD THIS LINE
-    created_at = models.DateTimeField(auto_now_add=True)
+    paid_date   = models.DateField(null=True, blank=True)
+    or_num      = models.CharField(max_length=50)
+    due_date    = models.DateField(null=True, blank=True)
+    created_at  = models.DateTimeField(auto_now_add=True)
 
 
 # ----------------- PAYABLES -----------------

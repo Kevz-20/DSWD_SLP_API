@@ -28,7 +28,14 @@ from .reporting import build_journal
 from .pdf_ledger import render_ledger_pdf
 from django.db.models.functions import Lower
 
-
+def _require_account_id(request) -> int:
+    aid = request.GET.get('account_id') or request.data.get('account_id')
+    if not aid:
+        raise ValidationError("account_id is required")
+    try:
+        return int(aid)
+    except ValueError:
+        raise ValidationError("account_id must be an integer")
 
 # THIS VIEW FOR CREATING ACCOUNT PAGE ( CREATE ACCOUNT ) -----------------------------------------------------------------------------------------------------------------------------
 @api_view(['POST'])
@@ -724,22 +731,26 @@ def customers(request):
 
 # CUSTOMER CREDITS
 @api_view(['GET'])
-def get_remaining_credit(request, customer_id):
-    account_id = request.GET.get('account') or request.GET.get('account_id')
+def get_remaining_credit(request, customer_id: int):
+    account_id = _require_account_id(request)
+
     try:
-        customer = Customer.objects.get(id=customer_id)
+        customer = Customer.objects.get(id=customer_id, account_id=account_id)
     except Customer.DoesNotExist:
         return Response({'error': 'Customer not found'}, status=404)
 
-    qs = SalesCredit.objects.filter(customer=customer, status=0)
-    if account_id:
-        qs = qs.filter(account_id=account_id)
+    # Sum remaining balances (amount is per-line remaining); include PARTIAL + UNPAID
+    total_utang = (SalesCredit.objects
+                   .filter(customer_id=customer_id, account_id=account_id, amount__gt=0)
+                   .aggregate(total=Sum('amount'))['total']) or Decimal('0.00')
 
-    total_utang = qs.aggregate(total=Sum('amount'))['total'] or 0
-    remaining = (customer.credit_limit or 0) - total_utang
+    credit_limit = Decimal(customer.credit_limit or 0)
+    remaining = credit_limit - total_utang
+    if remaining < 0:
+        remaining = Decimal('0.00')
 
+    # pick ONE key and stick to it (see client note below)
     return Response({'remaining_credit': float(remaining)}, status=200)
-
 
 
 @api_view(['GET'])
@@ -1126,21 +1137,30 @@ def transactions_list(request):
 
     credit_list = []
     for cr in credit_qs:
-        line_total = float(cr.amount or 0)
+        # Get original line total from SaleItem (not the mutable SalesCredit.amount)
+        try:
+            items = SaleItem.objects.filter(sale_id=cr.sale_id, stockin__product_id=cr.product_id)
+            total_val = sum((i.unit_price or 0) * (i.quantity or 0) for i in items)
+            line_total = float(total_val)
+        except Exception:
+            line_total = float(cr.amount or 0)  # fallback
+
         base = f"{cr.product.product_name} ({cr.quantity} pcs)" if cr.product_id else "Utang Sale"
         desc = f"{base} (Paid)" if cr.status == 1 else f"{base} (Unpaid)"
+
         sort_dt = cr.created_at
         credit_list.append({
             "type": "sale",
             "category": "Sale",
             "description": desc,
-            "amount": line_total,
+            "amount": line_total,   # ✅ now always shows original sale amount
             "payment_method": "Utang",
             "date": sort_dt.isoformat(),
             "occurred_at": sort_dt.isoformat(),
             "_sort_dt": sort_dt.timestamp(),
             "_seq": cr.id,
         })
+
 
     # -------------------- EXPENSES --------------------
     exp_qs = Expense.objects.select_related("product")
@@ -1277,25 +1297,29 @@ def transactions_list(request):
     for ct in cap_qs:
         sort_dt = ct.date
 
+        # 🚨 Prevent duplicate Downpayment showing under Capital
+        if ct.remarks and "downpayment" in ct.remarks.lower():
+            continue  # handled already under PayablePayment (Expense)
+
         if ct.transaction_type == "deposit":
             sign = "+"
         else:  # withdraw
             sign = "-"
 
         capital_list.append({
-            "type": "capital",  
+            "type": "capital",
             "category": "Capital",
             "description": ct.remarks or f"Capital {ct.transaction_type}",
             "amount": float(ct.amount),
-            "sign": sign,                        
+            "sign": sign,
             "payment_method": ct.transaction_type,
             "date": sort_dt.isoformat(),
             "occurred_at": sort_dt.isoformat(),
             "_sort_dt": sort_dt.timestamp(),
             "_seq": ct.id,
         })
-        
-    # -------------------- MERGE + FILTER + SORT --------------------
+
+# -------------------- MERGE + FILTER + SORT --------------------
     combined = (
         cash_list
         + credit_list
@@ -1310,8 +1334,8 @@ def transactions_list(request):
     elif filt == "expenses":
         combined = [x for x in combined if x["type"] == "expense"]
     elif filt == "capital":
-        combined = [x for x in combined if x["category"] == "Capital"] 
-    
+        combined = [x for x in combined if x["category"] == "Capital"]
+
     combined.sort(key=lambda x: (x["_sort_dt"], x["_seq"]), reverse=True)
 
     for x in combined:
@@ -1320,119 +1344,152 @@ def transactions_list(request):
     return Response(combined)
 
 
+
 # JESEL UPDATE --------------------------------------------------------------------------------------------------------------------------------
 @api_view(['GET'])
 def customer_debts(request, customer_id: int):
-    """
-    Returns sales grouped with products and sale-level due_date/status.
+    account_id = _require_account_id(request)
+    try:
+        Customer.objects.get(id=customer_id, account_id=account_id)
+    except Customer.DoesNotExist:
+        return Response({'error': 'Customer not found or forbidden'}, status=404)
 
-    status rules (per sale):
-      - paid:    every line is paid (status==1) or amount<=0
-      - unpaid:  every line is unpaid (status==0) and amount>0
-      - partial: a mix of paid and unpaid (or some zero-amounts)
-    due_date rule: the latest non-null due_date among the sale's lines.
-    """
-    # Important: fetch ALL credit lines (both paid and unpaid) to compute sale status correctly
-    qs = (
-        SalesCredit.objects
-        .filter(customer_id=customer_id)
-        .select_related('product', 'sale')
-        .order_by('sale_id', 'id')
-    )
+    qs = (SalesCredit.objects
+          .filter(customer_id=customer_id, account_id=account_id)
+          .select_related('product', 'sale')
+          .order_by('sale_id', 'id'))
 
     grouped = OrderedDict()
 
     for sc in qs:
         sale_id = sc.sale_id
 
-        # unit price: prefer amount/quantity; fallback to product.selling_price
-        if sc.quantity:
-            unit_price = float(sc.amount or 0) / sc.quantity
-        else:
-            unit_price = float(sc.product.selling_price) if sc.product else 0.0
-
-        product_item = {
-            "product_name": sc.product.product_name if sc.product else "",
-            "quantity": sc.quantity or 0,
-            "selling_price": unit_price,
-        }
+        # ----- immutable unit price (unchanged) -----
+        unit_price = 0.0
+        try:
+            items = SaleItem.objects.filter(sale_id=sale_id, stockin__product_id=sc.product_id)
+            total_qty = sum(i.quantity or 0 for i in items) or 0
+            if total_qty > 0:
+                total_val = sum((i.unit_price or 0) * (i.quantity or 0) for i in items)
+                unit_price = float(total_val / total_qty)
+        except Exception:
+            unit_price = 0.0
+        if unit_price == 0.0 and sc.product:
+            unit_price = float(sc.product.selling_price or 0)
 
         if sale_id not in grouped:
             grouped[sale_id] = {
                 "sale_id": sale_id,
                 "date": sc.credit_date.isoformat() if sc.credit_date else "",
-                "due_date": "",        # fill after loop
-                "status": "",          # fill after loop
+                "due_date": "",
+                "status": "",
                 "products": [],
-                # temp counters/holders
+                # temp fields
                 "__paid": 0,
                 "__unpaid": 0,
+                "__has_partial": False,     # 👈 NEW
                 "__due_latest": None,
+                "__remaining_sum": 0.0,
             }
 
         g = grouped[sale_id]
-        g["products"].append(product_item)
+        g["products"].append({
+            "product_name": sc.product.product_name if sc.product else "",
+            "quantity": sc.quantity or 0,
+            "selling_price": unit_price,
+        })
 
-        # temp counters for status calculation
-        is_paid_line = (sc.status == 1) or (float(sc.amount or 0) <= 0)
+        # accumulate remaining
+        g["__remaining_sum"] += float(sc.amount or 0)
+
+        # 👇 correct use of enum: mark partial lines
+        if sc.status == SalesCredit.CreditStatus.PARTIAL:
+            g["__has_partial"] = True
+
+        # 👇 a line is paid only if status = PAID (or amount <= 0)
+        is_paid_line = (sc.status == SalesCredit.CreditStatus.PAID) or (float(sc.amount or 0) <= 0)
         if is_paid_line:
             g["__paid"] += 1
         else:
             g["__unpaid"] += 1
 
-        # track the latest due_date among lines
+        # latest due date
         if sc.due_date:
             if g["__due_latest"] is None or sc.due_date > g["__due_latest"]:
                 g["__due_latest"] = sc.due_date
 
-    # finalize per-sale fields
+    # finalize
     result = []
     for sale in grouped.values():
         paid, unpaid = sale["__paid"], sale["__unpaid"]
 
-        if unpaid == 0:
-            sale_status = "paid"
-        elif paid == 0:
-            sale_status = "unpaid"
+        remaining_total = Decimal(str(sale["__remaining_sum"] or 0))
+        TOL = Decimal("0.0049")
+        if remaining_total < TOL:
+            remaining_total = Decimal("0.00")
+
+        # 👇 decide label for the card
+        if remaining_total == 0:
+            sale["status"] = "paid"
+        elif sale["__has_partial"] or (paid > 0 and unpaid > 0):
+            sale["status"] = "partial"     # <-- this drives your yellow “Partially Paid”
         else:
-            sale_status = "partial"
+            sale["status"] = "unpaid"
 
-        sale["status"] = sale_status
         sale["due_date"] = sale["__due_latest"].isoformat() if sale["__due_latest"] else ""
+        sale["remaining_total"] = float(remaining_total.quantize(Decimal("0.01")))
 
-        # drop temp keys
-        for k in ("__paid", "__unpaid", "__due_latest"):
+        for k in ("__paid", "__unpaid", "__has_partial", "__due_latest", "__remaining_sum"):
             sale.pop(k, None)
 
-        result.append(sale)
+        # hide fully paid cards
+        if remaining_total > Decimal("0.00"):
+            result.append(sale)
 
-    return Response(result, status=status.HTTP_200_OK)
+    resp = Response(result, status=status.HTTP_200_OK)
+    resp["Cache-Control"] = "no-store"
+    return resp
 
 
-# Inside the 'apply_customer_payment' view: JESEL UPDATE ----------------------------------------------------------------------------------
-PAID = 1
-UNPAID = 0
-# PARTIAL = 2  # (optional) if you add this state later
+from decimal import Decimal, ROUND_HALF_UP
+from django.db import transaction
+from django.utils import timezone
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from rest_framework import status
+
+from .models import SalesCredit, CapitalTransaction
+
 
 @api_view(['POST'])
 def apply_customer_payment(request, customer_id: int):
-    from decimal import Decimal
-    try:
-        amt = Decimal(str(request.data.get('amount', 0)))
-    except Exception:
-        return Response({'error': 'Invalid amount'}, status=400)
-    if amt <= 0:
-        return Response({'error': 'Amount must be > 0'}, status=400)
+    """
+    Applies a payment to a customer's outstanding SalesCredit for the given account.
+    Allocates oldest dues first (due_date, then credit_date, then id).
+    Deducts from remaining per-line amount (SalesCredit.amount = remaining balance).
+    Creates a CapitalTransaction entry for the applied amount.
+    """
 
+    # ---- validate amount ----
+    try:
+        amt = Decimal(str(request.data.get('amount', 0))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    except Exception:
+        return Response({'error': 'Invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if amt <= 0:
+        return Response({'error': 'Amount must be > 0'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # ---- validate account ----
     raw_account_id = request.data.get('account_id')
     try:
         account_id = int(raw_account_id)
     except (TypeError, ValueError):
-        return Response({'error': 'account_id is required and must be an integer'}, status=400)
+        return Response({'error': 'account_id is required and must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
 
+    # ---- fetch open credits ----
     qs = (
         SalesCredit.objects
-        .filter(customer_id=customer_id, amount__gt=0, account_id=account_id)  # 👈 scoped
+        .filter(customer_id=customer_id, account_id=account_id, amount__gt=0)
         .order_by('due_date', 'credit_date', 'id')
     )
 
@@ -1440,18 +1497,36 @@ def apply_customer_payment(request, customer_id: int):
     allocations = []
 
     with transaction.atomic():
-        for sc in qs.select_for_update():
+        locked = list(qs.select_for_update())
+
+        for sc in locked:
             if remaining_amt <= 0:
                 break
-            line_remaining = Decimal(sc.amount or 0)
+
+            line_remaining = Decimal(sc.amount or 0).quantize(Decimal('0.01'))
+            if line_remaining <= 0:
+                continue
+
             applied = min(line_remaining, remaining_amt)
-            sc.amount = line_remaining - applied
-            if sc.amount <= 0:
-                sc.status = PAID
+            new_remaining = (line_remaining - applied).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+            # Clamp tiny residuals
+            if new_remaining < Decimal('0.005'):
+                new_remaining = Decimal('0.00')
+
+            sc.amount = new_remaining
+
+            if new_remaining <= 0:
+                sc.status = SalesCredit.CreditStatus.PAID
                 sc.paid_date = timezone.now().date()
-                sc.save(update_fields=['amount', 'status', 'paid_date'])
+                update_fields = ['amount', 'status', 'paid_date']
+            elif applied > 0:
+                sc.status = SalesCredit.CreditStatus.PARTIAL
+                update_fields = ['amount', 'status']
             else:
-                sc.save(update_fields=['amount'])
+                update_fields = ['amount']
+
+            sc.save(update_fields=update_fields)
 
             allocations.append({
                 'sale_id': sc.sale_id,
@@ -1459,14 +1534,16 @@ def apply_customer_payment(request, customer_id: int):
                 'remaining': float(sc.amount),
                 'due_date': sc.due_date.isoformat() if sc.due_date else ''
             })
-            remaining_amt -= applied
+
+            remaining_amt = (remaining_amt - applied).quantize(Decimal('0.01'))
 
         applied_total = amt - remaining_amt
         if applied_total <= 0:
-            return Response({'error': 'No open balances to apply this payment.'}, status=400)
+            return Response({'error': 'No open balances to apply this payment.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # ---- log into CapitalTransaction ----
         CapitalTransaction.objects.create(
-            account_id=account_id,                              # 👈 required
+            account_id=account_id,
             amount=applied_total,
             transaction_type='deposit',
             remarks=f'Customer payment (customer_id={customer_id}, account_id={account_id})'
@@ -1476,7 +1553,8 @@ def apply_customer_payment(request, customer_id: int):
         'allocations': allocations,
         'applied_total': float(applied_total),
         'unapplied_balance': float(remaining_amt),
-    }, status=200)
+    }, status=status.HTTP_200_OK)
+
 
 
 class PayableViewSet(viewsets.ModelViewSet):
