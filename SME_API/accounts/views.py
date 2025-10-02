@@ -1258,16 +1258,24 @@ def transactions_list(request):
     for ct in cap_qs:
         sort_dt = ct.date
 
-        # 🚨 Skip downpayments here → they are already shown under Payable Payments (expense)
+        # 🚨 Show ONLY manual Capital deposits/withdraws
         if ct.remarks:
             rm = ct.remarks.lower()
-            if "downpayment" in rm or "down payment" in rm or rm.startswith("dp"):
-                continue
-
+            if (
+                "downpayment" in rm or
+                "payable" in rm or
+                "payment" in rm or
+                "expense" in rm or
+                "stock-in" in rm or
+                "deleted product" in rm or
+                "cash sale" in rm or
+                "customer payment" in rm
+            ):
+                continue  # skip anything system-generated
 
         if ct.transaction_type == "deposit":
             sign = "+"
-        else:  
+        else:
             sign = "-"
 
         capital_list.append({
@@ -1283,7 +1291,8 @@ def transactions_list(request):
             "_seq": ct.id,
         })
 
-    # -------------------- MERGE + FILTER + SORT --------------------
+
+# -------------------- MERGE + FILTER + SORT --------------------
     combined = (
         cash_list
         + credit_list
@@ -1291,7 +1300,7 @@ def transactions_list(request):
         + payable_payments_list
         + expenses_list
         + capital_list
-    )
+        )
 
     if filt == "sales":
         combined = [x for x in combined if x["type"] == "sale"]
@@ -1306,6 +1315,7 @@ def transactions_list(request):
         x.pop("_sort_dt", None)
 
     return Response(combined)
+   
 
 # JESEL UPDATE --------------------------------------------------------------------------------------------------------------------------------
 @api_view(['GET'])
