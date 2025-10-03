@@ -368,7 +368,7 @@ def delete_inventory(request):
     return Response({'message': 'Deleted quantity from batch and recorded expense.'}, status=status.HTTP_200_OK)
 
 
-# THIS VIEW FOR RECORD EXPENSES BILLS, UTILITIES ETC ( RECORD EXPENSES ) ---------------------------------------------------------------------------------------------------------------
+# THIS VIEW FOR RECORD EXPENSES BILLS, UTILITIES ETC ( RECORD EXPENSES ) -----------------------------------
 @api_view(['POST'])
 def record_expense(request):
     try:
@@ -385,8 +385,8 @@ def record_expense(request):
         # Get account
         account = Account.objects.get(id=account_id)
 
-        # ✅ Record only as Expense (no CapitalTransaction mirror)
-        Expense.objects.create(
+        # ✅ Save Expense
+        expense = Expense.objects.create(
             account=account,
             amount=amount,
             category=category,
@@ -394,7 +394,21 @@ def record_expense(request):
             receipt=receipt
         )
 
-        return Response({'message': 'Expense recorded successfully.'}, status=status.HTTP_201_CREATED)
+        # ✅ Deduct from Capital (Withdraw)
+        CapitalTransaction.objects.create(
+            account_id=account.id,
+            amount=amount,
+            transaction_type='withdraw',
+            remarks=f"Expense: {category} - {description}"
+        )
+
+        return Response(
+            {
+                'message': 'Expense recorded and deducted from capital successfully.',
+                'expense_id': expense.id
+            },
+            status=status.HTTP_201_CREATED
+        )
 
     except Account.DoesNotExist:
         return Response({'error': 'Account not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -1153,7 +1167,7 @@ def transactions_list(request):
             "_seq": cr.id,
         })
 
-    # -------------------- EXPENSES --------------------
+   # -------------------- EXPENSES --------------------
     exp_qs = Expense.objects.select_related("product")
     if account_id:
         exp_qs = exp_qs.filter(account_id=account_id)
@@ -1174,7 +1188,7 @@ def transactions_list(request):
 
         if e.product_id:
             name = e.product.product_name
-            desc = f"{name}" if not is_stockin else f"{name} ({e.quantity or ''} pcs)"
+            desc = f"{name}" if not is_stockin else f"{name} (Stock-in)"
         else:
             desc = e.description or e.category or "Expense"
 
@@ -1190,6 +1204,7 @@ def transactions_list(request):
             "_sort_dt": sort_dt.timestamp(),
             "_seq": e.id,
         })
+
 
     # -------------------- CUSTOMER PAYMENTS (Capital deposits) --------------------
     pay_qs = CapitalTransaction.objects.filter(
