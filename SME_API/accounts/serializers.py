@@ -5,6 +5,8 @@ from django.utils import timezone  # type: ignore
 from django.db.models import Sum, Case, When, F, DecimalField  # type: ignore
 from django.db.models.functions import Coalesce
 from rest_framework import serializers  # type: ignore
+from rest_framework.exceptions import ValidationError
+
 
 from .models import (
     Account, CapitalTransaction, Expense, Product, Sale, SaleItem,

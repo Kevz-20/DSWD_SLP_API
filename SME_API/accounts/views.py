@@ -121,66 +121,33 @@ class CapitalTransactionListCreateView(generics.ListCreateAPIView):
 
 # THIS VIEW FOR STOCK IN PRODUCTS ( STOCK - IN ) ----------------------------------------------------------------------------------------------------------------------------------------
 @api_view(['POST'])
-@parser_classes([MultiPartParser, FormParser])  # 👈 Required for image upload
+@parser_classes([MultiPartParser, FormParser])
 def add_product_with_stockin(request):
     print("FILES received:", request.FILES)
     print("Image:", request.FILES.get('image'))
 
-    # ✅ make sure we have the account_id, pass it to the serializer context
     account_id = request.data.get('account_id')
     if not account_id:
         return Response({"error": "account_id is required"}, status=status.HTTP_400_BAD_REQUEST)
 
     serializer = AddProductStockInSerializer(
         data=request.data,
-        context={'account_id': account_id}  # 👈 important
+        context={'account_id': account_id}
     )
 
     if serializer.is_valid():
         try:
             with transaction.atomic():
-                # ✅ Save product and stockin using serializer
                 product = serializer.save()
 
-                # ✅ Save product image if not yet set
                 image = request.FILES.get('image')
                 if image and not product.image:
                     product.image = image
                     product.save()
 
-                # ✅ Find latest stockin for cost calculation
-                latest_stockin = StockIn.objects.filter(product=product).order_by('-created_at').first()
-                if not latest_stockin:
-                    return Response({"error": "Stock-in not found after saving."}, status=500)
-
-                # ✅ Capital validation (PER ACCOUNT)
-                try:
-                    acct = int(account_id)
-                except (TypeError, ValueError):
-                    acct = None
-
-                total_cost = latest_stockin.purchase_price * latest_stockin.quantity
-
-                qs = CapitalTransaction.objects.all()
-                if acct is not None:
-                    qs = qs.filter(account_id=acct)
-
-                deposits = qs.filter(transaction_type='deposit').aggregate(Sum('amount'))['amount__sum'] or 0
-                withdrawals = qs.filter(transaction_type='withdraw').aggregate(Sum('amount'))['amount__sum'] or 0
-                balance = deposits - withdrawals
-
-                if total_cost > balance:
-                    raise ValidationError("❌ Not enough capital to stock this product.")
-
-                # ✅ Deduct from capital (this is separate from Expense; your post_save signal writes the Expense)
-                CapitalTransaction.objects.create(
-                    account_id=acct,  # 08-27-2025 ---------------------------------------------------------------------------------------
-                    amount=total_cost,
-                    transaction_type='withdraw',
-                    remarks=f"Stock-in: {product.product_name}"
-                )
-
-                return Response({"message": "✅ Product added and capital deducted."}, status=status.HTTP_201_CREATED)
+                # ✅ No capital deduction here
+                return Response({"message": "✅ Product added successfully (capital unchanged)."},
+                                status=status.HTTP_201_CREATED)
 
         except ValidationError as e:
             return Response({"error": str(e.detail[0])}, status=400)
@@ -420,12 +387,16 @@ def record_expense(request):
 def list_expenses(request):
     """
     GET /api/expenses/?account=12&start=YYYY-MM-DD&end=YYYY-MM-DD
+    Returns all non–Stock-In expenses for the given account.
     """
     account_id = request.GET.get('account') or request.GET.get('account_id')
     if not account_id:
         return Response({'error': 'account is required'}, status=400)
 
     qs = Expense.objects.filter(account_id=account_id)
+
+    # 🧹 Exclude stock-in related entries
+    qs = qs.exclude(category__iexact='Inventory Purchase')
 
     start = request.GET.get('start')
     end = request.GET.get('end')
@@ -436,7 +407,6 @@ def list_expenses(request):
 
     serializer = ExpenseSerializer(qs.order_by('-created_at'), many=True)
     return Response(serializer.data)
-
 
 
 # FOR RECORD SALE PAGE
@@ -1179,23 +1149,20 @@ def transactions_list(request):
 
     expenses_list = []
     for e in exp_qs:
+        # 🛑 Skip Inventory Purchase (Stock-in) expenses
         is_stockin = (
             (e.category == Expense.INVENTORY_PURCHASE)
             if hasattr(Expense, "INVENTORY_PURCHASE")
             else (e.category == "Inventory Purchase")
         )
-        category = "Stock-in" if is_stockin else "Expense"
+        if is_stockin:
+            continue  # ← don’t include in transaction history
 
-        if e.product_id:
-            name = e.product.product_name
-            desc = f"{name}" if not is_stockin else f"{name} (Stock-in)"
-        else:
-            desc = e.description or e.category or "Expense"
-
+        desc = e.description or e.category or "Expense"
         sort_dt = e.created_at
         expenses_list.append({
             "type": "expense",
-            "category": category,
+            "category": "Expense",
             "description": desc,
             "amount": float(e.amount or 0),
             "payment_method": None,
