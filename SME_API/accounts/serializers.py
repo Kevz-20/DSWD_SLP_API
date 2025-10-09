@@ -18,12 +18,51 @@ from .models import (
 # ==========================
 
 class AccountSerializer(serializers.ModelSerializer):
-    # Let DRF read the model's @property full_name
-    full_name = serializers.ReadOnlyField()
+    full_name = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Account
-        fields = ['id', 'first_name', 'middle_name', 'last_name', 'phone_number', 'pin', 'full_name']
+        fields = [
+            'id', 'first_name', 'middle_name', 'last_name',
+            'phone_number', 'pin', 'security_question_id', 'full_name'
+        ]
+        read_only_fields = ['security_question_id', 'full_name']
+
+    def get_full_name(self, obj):
+        parts = [obj.first_name, obj.middle_name, obj.last_name]
+        return " ".join([p for p in parts if p and p.strip()])
+
+
+class AccountCreateSerializer(serializers.ModelSerializer):
+    security_answer = serializers.CharField(write_only=True)
+
+    class Meta:
+        model = Account
+        fields = [
+            "first_name", "middle_name", "last_name",
+            "phone_number", "pin",
+            "security_question_id", "security_answer",
+        ]
+
+    def create(self, validated_data):
+        answer = validated_data.pop("security_answer", "")
+        acct = Account(**validated_data)
+        acct.set_security_answer(answer)  # hashes into security_answer_hash
+        acct.save()
+        return acct
+    
+class ForgotStartSerializer(serializers.Serializer):
+    phone_number = serializers.RegexField(r"^09\d{9}$")
+
+
+class ForgotVerifySerializer(serializers.Serializer):
+    phone_number = serializers.RegexField(r"^09\d{9}$")
+    answer = serializers.CharField()
+
+
+class ForgotResetSerializer(serializers.Serializer):
+    reset_token = serializers.UUIDField()
+    new_pin = serializers.RegexField(r"^\d{4}$")
 
 
 # ==========================

@@ -27,6 +27,9 @@ from django.http import HttpResponse
 from .reporting import build_journal
 from .pdf_ledger import render_ledger_pdf
 from django.db.models.functions import Lower
+from .serializers import AccountCreateSerializer  # add this import
+from .serializers import ForgotStartSerializer, ForgotVerifySerializer, ForgotResetSerializer
+from .models import ForgotPinToken, SECURITY_QUESTIONS
 
 def _require_account_id(request) -> int:
     aid = request.GET.get('account_id') or request.data.get('account_id')
@@ -39,13 +42,62 @@ def _require_account_id(request) -> int:
 
 # THIS VIEW FOR CREATING ACCOUNT PAGE ( CREATE ACCOUNT ) -----------------------------------------------------------------------------------------------------------------------------
 @api_view(['POST'])
+@permission_classes([AllowAny])
 def create_account(request):
-    serializer = AccountSerializer(data=request.data)
+    serializer = AccountCreateSerializer(data=request.data)
     if serializer.is_valid():
-        serializer.save()
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        acct = serializer.save()
+        # Return the standard read shape (no secret answer)
+        return Response(AccountSerializer(acct).data, status=status.HTTP_201_CREATED)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def forgot_pin_start(request):
+    s = ForgotStartSerializer(data=request.data); s.is_valid(raise_exception=True)
+    phone = s.validated_data['phone_number']
+    try:
+        acct = Account.objects.get(phone_number=phone)
+    except Account.DoesNotExist:
+        return Response({"error": "Account not found."}, status=404)
+    return Response({
+        "question_id": acct.security_question_id,
+        "question_text": SECURITY_QUESTIONS.get(acct.security_question_id, "")
+    })
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def forgot_pin_verify(request):
+    s = ForgotVerifySerializer(data=request.data); s.is_valid(raise_exception=True)
+    phone = s.validated_data['phone_number']; answer = s.validated_data['answer']
+    try:
+        acct = Account.objects.get(phone_number=phone)
+    except Account.DoesNotExist:
+        return Response({"error": "Account not found."}, status=404)
+    if not acct.check_security_answer(answer):
+        return Response({"error": "Incorrect answer."}, status=400)
+    token = ForgotPinToken.issue(phone)
+    return Response({"reset_token": str(token.token)})
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def forgot_pin_reset(request):
+    s = ForgotResetSerializer(data=request.data); s.is_valid(raise_exception=True)
+    token = s.validated_data['reset_token']; new_pin = s.validated_data['new_pin']
+    try:
+        tok = ForgotPinToken.objects.get(token=token, used=False)
+    except ForgotPinToken.DoesNotExist:
+        return Response({"error": "Invalid token."}, status=400)
+    if not tok.is_valid():
+        return Response({"error": "Token expired or used."}, status=400)
+    acct = Account.objects.get(phone_number=tok.phone_number)
+    acct.pin = new_pin
+    acct.save(update_fields=["pin"])
+    tok.used = True
+    tok.save(update_fields=["used"])
+    return Response({"ok": True})
 
 # THIS VIEW FOR LOGIN ( LOG IN ) ------------------------------------------------------------------------------------------------------------------------------------------------------
 @api_view(['POST'])

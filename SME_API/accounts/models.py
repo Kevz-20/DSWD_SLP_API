@@ -9,6 +9,20 @@ from io import BytesIO
 from django.core.files.base import ContentFile
 import os
 
+from django.db import models
+from django.utils import timezone
+from django.contrib.auth.hashers import make_password, check_password
+import uuid
+from datetime import timedelta
+
+SECURITY_QUESTIONS = {
+    101: "Unsa ang una nimo negosyo?",
+    102: "Asa ka una nagbutang ug tindahan o pwesto?",
+    103: "Kinsay imong unang silingan o suod nga amigo/amiga sa pagkabata?",
+    104: "Asa nga tindahan o merkado ka una kanunay mamalit ug pagkaon o gamit?",
+    105: "Asa imong paboritong lugar nga bisitahan?",
+    106: "Unsa ang butang nga kanunay nimo dala kung mag-biyahe ka?",
+}
 
 # ----------------- CAPITAL -----------------
 class CapitalTransaction(models.Model):
@@ -40,22 +54,44 @@ class SalesCreditPayment(models.Model):
 
 # ----------------- ACCOUNT -----------------
 class Account(models.Model):
-    first_name = models.CharField(max_length=100, blank=True, default="")
-    middle_name = models.CharField(max_length=50, blank=True, default="")
-    last_name = models.CharField(max_length=100, blank=True, default="")
-    phone_number = models.CharField(max_length=15, unique=True)
-    pin = models.CharField(
-        max_length=4,
-        validators=[RegexValidator(r'^\d{4}$', 'PIN must be exactly 4 digits.')]
-    )
+    first_name = models.CharField(max_length=100)
+    middle_name = models.CharField(max_length=100, blank=True, null=True)
+    last_name = models.CharField(max_length=100)
+    phone_number = models.CharField(max_length=11, unique=True)  # "09xxxxxxxxx"
+    pin = models.CharField(max_length=4)
+
+    # ✅ ADD DEFAULTS so existing rows can be populated
+    security_question_id = models.IntegerField(default=0)          # 0 = “not set” (or use 101 if you prefer)
+    security_answer_hash = models.CharField(max_length=255, default='')
+
+    def set_security_answer(self, answer: str):
+        norm = (answer or "").strip().lower()
+        self.security_answer_hash = make_password(norm)
+
+    def check_security_answer(self, answer: str) -> bool:
+        norm = (answer or "").strip().lower()
+        return check_password(norm, self.security_answer_hash)
 
     @property
-    def full_name(self) -> str:
-        return " ".join(p for p in [self.first_name, self.middle_name, self.last_name] if p).strip()
+    def security_question_text(self) -> str:
+        return SECURITY_QUESTIONS.get(self.security_question_id, "")
+    
 
-    def __str__(self) -> str:
-        label = self.full_name or "(no name)"
-        return f"{label} — {self.phone_number}"
+class ForgotPinToken(models.Model):
+    phone_number = models.CharField(max_length=11)
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    expires_at = models.DateTimeField()
+    used = models.BooleanField(default=False)
+
+    @classmethod
+    def issue(cls, phone_number: str, minutes_valid: int = 10):
+        return cls.objects.create(
+            phone_number=phone_number,
+            expires_at=timezone.now() + timedelta(minutes=minutes_valid),
+        )
+
+    def is_valid(self) -> bool:
+        return (not self.used) and (self.expires_at > timezone.now())
 
 
 # ----------------- PRODUCT (thumbnail added; original image path unchanged) -----------------
