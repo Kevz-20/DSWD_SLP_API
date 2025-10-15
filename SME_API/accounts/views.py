@@ -1012,19 +1012,19 @@ def revenue_report(request):
     if not start_date or not end_date or end_date < start_date:
         return Response({'error': 'Valid start_date and end_date are required.'}, status=400)
 
-    # CASH sales (DateField) – OK to use __range on date
+    # CASH sales
     cash_qs = SalesCash.objects.filter(date__range=(start_date, end_date))
     if account_id:
         cash_qs = cash_qs.filter(account_id=account_id)
     cash_sales_total = cash_qs.aggregate(total=Sum('amount'))['total'] or 0
 
-    # CREDIT sales recognized on credit_date (DateField) – OK
+    # CREDIT sales
     credit_qs = SalesCredit.objects.filter(credit_date__range=(start_date, end_date))
     if account_id:
         credit_qs = credit_qs.filter(account_id=account_id)
     credit_sales_total = credit_qs.aggregate(total=Sum('amount'))['total'] or 0
 
-    # Collections / unpaid breakdowns (DateFields) – OK
+    # Collections / unpaid (not used in totals but kept for display)
     paid_qs = SalesCredit.objects.filter(status=1, paid_date__isnull=False,
                                          paid_date__range=(start_date, end_date))
     unpaid_qs = SalesCredit.objects.filter(status=0, credit_date__range=(start_date, end_date))
@@ -1035,9 +1035,8 @@ def revenue_report(request):
     paid_credit_total = paid_qs.aggregate(total=Sum('amount'))['total'] or 0
     unpaid_credit_total = unpaid_qs.aggregate(total=Sum('amount'))['total'] or 0
 
-    # EXPENSES (DateTimeField) – use Manila-local window
+    # EXPENSES (exclude legacy "Inventory Purchase" so stock-in never shows)
     def local_bounds(d):
-        # Naïve datetimes in local time because USE_TZ = False
         start_local = datetime.combine(d, dt_time.min)
         end_local = datetime.combine(d, dt_time.max)
         return start_local, end_local
@@ -1048,8 +1047,16 @@ def revenue_report(request):
     expenses_qs = Expense.objects.all()
     if account_id:
         expenses_qs = expenses_qs.filter(account_id=account_id)
+
     expenses_qs = expenses_qs.filter(created_at__gte=start_dt_local,
                                      created_at__lte=end_dt_local)
+
+    # ✅ Hard exclude Inventory Purchase
+    if hasattr(Expense, "INVENTORY_PURCHASE"):
+        expenses_qs = expenses_qs.exclude(category=Expense.INVENTORY_PURCHASE)
+    else:
+        expenses_qs = expenses_qs.exclude(category__iexact="Inventory Purchase")
+
     expenses_total = expenses_qs.aggregate(total=Sum('amount'))['total'] or 0
 
     total_revenue = (cash_sales_total or 0) + (credit_sales_total or 0)
@@ -1068,6 +1075,7 @@ def revenue_report(request):
         'expenses': round(float(expenses_total), 2),
         'net_profit': round(float(net_profit), 2),
     })
+
 
 
 # --- EXPENSES SUMMARY (for Income Statement PDF) ------------------------------
@@ -1098,6 +1106,12 @@ def expenses_summary(request):
     if account_id:
         qs = qs.filter(account_id=account_id)
 
+    # ⛔️ exclude legacy Stock-In rows from the IS breakdown
+    if hasattr(Expense, "INVENTORY_PURCHASE"):
+        qs = qs.exclude(category=Expense.INVENTORY_PURCHASE)
+    else:
+        qs = qs.exclude(category__iexact='Inventory Purchase')
+
     qs = qs.filter(created_at__gte=start_dt_local,
                    created_at__lte=end_dt_local)
 
@@ -1109,6 +1123,7 @@ def expenses_summary(request):
     } for r in rows]
 
     return Response({'items': items})
+
 
 
 # NEW: secure full-name update that requires a valid PIN
@@ -1701,7 +1716,8 @@ def balance_sheet(request):
     """
     GET /api/balance-sheet/?account=12&as_of=YYYY-MM-DD
     Returns Assets/Liabilities/Owner's Equity.
-    NOTE: We treat CapitalTransaction as your cashbook.
+    Under the new rule, Inventory does NOT come from StockIn; it stays 0
+    unless you later decide to book it via a dedicated expense/category flow.
     """
     from decimal import Decimal
     account_id = request.GET.get("account") or request.GET.get("account_id")
@@ -1718,77 +1734,62 @@ def balance_sheet(request):
         if model_field.get_internal_type() == "DateField":
             return qs.filter(**{f"{field}__lte": as_of})
         else:
-            # DateTimeField
             return qs.filter(**{f"{field}__lte": datetime.combine(as_of, datetime.max.time())})
 
     def _sum(qs, field="amount"):
         return qs.aggregate(total=Sum(field))["total"] or Decimal("0")
 
-    # ---- CASH (asset) — use cashbook
+    # CASH (asset) — from cashbook
     caps = scoped(CapitalTransaction.objects.all())
     caps = as_of_date(caps, "date")
     deposits = _sum(caps.filter(transaction_type="deposit"))
     withdrawals = _sum(caps.filter(transaction_type="withdraw"))
     cash = deposits - withdrawals
 
-    # ---- Revenue (for Net Income)
+    # Revenue (for Net Income)
     cash_sales = scoped(SalesCash.objects.all())
     cash_sales = as_of_date(cash_sales, "created_at")
     revenue_cash = _sum(cash_sales, "amount")
 
     credit_sales = scoped(SalesCredit.objects.all())
     credit_sales = as_of_date(credit_sales, "created_at")
-    # WARNING: SalesCredit.amount is mutable (reduced by payments). This counts remaining, not original.
+    # NOTE: amount on SalesCredit is remaining; acceptable for this simplified model
     revenue_credit = _sum(credit_sales, "amount")
 
     total_revenue = revenue_cash + revenue_credit
 
-    # ---- COGS (approx via StockIn purchase_price * quantities sold)
-    # ---- COGS (approx via StockIn purchase_price * quantities sold)
-    si = SaleItem.objects.select_related("stockin", "sale")
-    if account_id:
-        si = si.filter(sale__account_id=account_id)   # 👈 scope to account
-    if as_of:
-        si = si.filter(sale__created_at__date__lte=as_of)
-    cogs = si.aggregate(total=Sum(F("quantity") * F("stockin__purchase_price")))["total"] or Decimal("0")
+    # COGS disabled (kept at 0)
+    cogs = Decimal("0")
 
-
-    # ---- Operating expenses (exclude inventory purchases)
+    # Operating expenses (exclude inventory purchase)
     exp = scoped(Expense.objects.all())
     exp = as_of_date(exp, "created_at")
     if hasattr(Expense, "INVENTORY_PURCHASE"):
         exp = exp.exclude(category=Expense.INVENTORY_PURCHASE)
     else:
-        exp = exp.exclude(category="Inventory Purchase")
+        exp = exp.exclude(category__iexact="Inventory Purchase")
     operating_expenses = _sum(exp, "amount")
 
-    # ---- Accounts Receivable (AR) — sum of unpaid credit lines AS OF
+    # Accounts Receivable (unpaid credit lines)
     ar_lines = scoped(SalesCredit.objects.filter(status=0))
     ar_lines = as_of_date(ar_lines, "created_at")
     accounts_receivable = _sum(ar_lines, "amount")
 
-    # ---- Inventory (snapshot)
-    stock = scoped(StockIn.objects.all())
-    stock = as_of_date(stock, "created_at")
-    inventory = stock.aggregate(
-        total=Sum(F("remaining_quantity") * F("purchase_price"))
-    )["total"] or Decimal("0")
+    # ✅ Inventory disabled per new rule
+    inventory = Decimal("0")
 
-    # ---- Payables (open)
+    # Payables (open)
     payables_open = scoped(Payable.objects.filter(is_paid=False))
     accounts_payable = payables_open.aggregate(total=Sum("remaining_amount"))["total"] or Decimal("0")
 
-    # ---- Net income & equity
+    # Net income & equity
     net_income = total_revenue - cogs - operating_expenses
 
-    # You previously called this "Capital, beginning" using deposits-withdrawals,
-    # but that equals current cash when CapitalTransaction is used as a cashbook.
-    # To keep your output labels, we’ll show it as deposits-withdrawals (as-of):
-    capital_beginning = deposits - withdrawals
-
+    # Treat "Capital, beginning" as deposits-withdrawals (cashbook baseline)
+    aid = int(account_id) if account_id else None
+    capital_beginning = compute_owner_capital(aid) if aid else Decimal("0")
     total_equity = capital_beginning + net_income
 
-    # ---- Totals & check
     total_assets = cash + accounts_receivable + inventory
     total_liabilities = accounts_payable
     check = total_assets - (total_liabilities + total_equity)
@@ -1814,6 +1815,7 @@ def balance_sheet(request):
         "Total Liabilities + Equity": f"{(total_liabilities + total_equity):.2f}",
         "balance_check": f"{check:.2f}"
     })
+
 
 
 @api_view(["GET"])
