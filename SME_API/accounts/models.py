@@ -231,12 +231,21 @@ class SaleItem(models.Model):
         return f"{self.stockin.product.product_name} x{self.quantity}"
 
 
-# ----------------- CAPITAL (simple) -----------------
-class Capital(models.Model):
-    account = models.ForeignKey(Account, on_delete=models.CASCADE)
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
-    description = models.TextField()
-    created_at = models.DateTimeField(auto_now_add=True)
+# ----------------- BANK -----------------
+class BankTransaction(models.Model):
+    TRANSACTION_TYPE_CHOICES = [('deposit', 'Deposit'), ('withdraw', 'Withdraw')]
+
+    account = models.ForeignKey('Account', on_delete=models.CASCADE, db_index=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPE_CHOICES)
+    remarks = models.TextField(blank=True, null=True)
+    date = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        indexes = [models.Index(fields=['account', 'date'])]
+
+    def __str__(self):
+        return f"{self.transaction_type.capitalize()} ₱{self.amount} (acct {self.account_id})"
 
 
 # ----------------- SALES CASH -----------------

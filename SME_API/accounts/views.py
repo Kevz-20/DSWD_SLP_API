@@ -3,11 +3,11 @@ import uuid
 from rest_framework.response import Response  # type: ignore  # ✅ Correct import
 from rest_framework import status  # type: ignore  # ✅ Correct import
 from django.utils import timezone  # type: ignore  # ✅ Correct import
-from .models import Account, CapitalTransaction, Expense, Product, SaleItem, StockIn, SalesCash, Sale, SalesCredit, Customer, Account, Payable, PayablePayment
+from .models import Account, CapitalTransaction, Expense, Product, SaleItem, StockIn, SalesCash, Sale, SalesCredit, Customer, Account, Payable, PayablePayment,BankTransaction
 from .serializers import AccountSerializer, BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerCreateSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer, AccountNameSerializer, ExpenseSerializer, UpdateStockInSerializer, PayableSerializer, PayableCreateSerializer, PayablePaymentSerializer
 from datetime import date, time, datetime, time as dt_time, date as dt_date, timedelta
 from rest_framework import viewsets, generics  # type: ignore  # ✅ Correct import
-from django.db.models import Sum  # type: ignore
+from django.db.models import Sum,Case,When  # type: ignore
 from . import serializers
 from rest_framework.parsers import MultiPartParser, FormParser  # type: ignore
 from rest_framework.decorators import api_view, parser_classes , action, permission_classes # type: ignore
@@ -30,6 +30,7 @@ from django.db.models.functions import Lower
 from .serializers import AccountCreateSerializer  # add this import
 from .serializers import ForgotStartSerializer, ForgotVerifySerializer, ForgotResetSerializer
 from .models import ForgotPinToken, SECURITY_QUESTIONS
+from django.views.decorators.http import require_GET
 
 def _require_account_id(request) -> int:
     aid = request.GET.get('account_id') or request.data.get('account_id')
@@ -127,17 +128,17 @@ def get_account(request, phone_number):
 # 08-27-2025 ---------------------------------------------------------------------------------------------------------------------------------
 @api_view(['GET'])
 def get_current_capital_balance(request):
-    account_id = request.GET.get('account_id')
+    aid = request.GET.get('account_id')
+    if not aid:
+        return Response({'error': 'account_id is required'}, status=400)
+    try:
+        aid = int(aid)
+    except ValueError:
+        return Response({'error': 'account_id must be an integer'}, status=400)
 
-    qs = CapitalTransaction.objects.all()
-    if account_id:
-        qs = qs.filter(account_id=account_id)
+    owner_cap = compute_owner_capital(aid)     # ✅ owner equity only
+    return Response({'balance': float(owner_cap)})
 
-    deposits = qs.filter(transaction_type__iexact='deposit').aggregate(Sum('amount'))['amount__sum'] or 0
-    withdrawals = qs.filter(transaction_type__iexact='withdraw').aggregate(Sum('amount'))['amount__sum'] or 0
-    balance = deposits - withdrawals
-
-    return Response({'balance': float(balance)})
 
 
 # ADD CAPITAL ( CAPITAL MANAGEMENT ) --------------------------------------------------------------------------------------------------------------------------------------------------
@@ -150,13 +151,14 @@ class CapitalTransactionListCreateView(generics.ListCreateAPIView):
         transaction_type = serializer.validated_data['transaction_type']
         amount = serializer.validated_data['amount']
 
-        # get from body; accept either id or None (coerce to int/None)
+        # account_id comes from body; coerce to int or None
         raw = self.request.data.get('account_id')
         try:
             acct = int(raw) if raw not in (None, "",) else None
         except ValueError:
             acct = None
 
+        # Compute current capital cashbook balance (for this account if provided)
         qs = CapitalTransaction.objects.all()
         if acct is not None:
             qs = qs.filter(account_id=acct)
@@ -165,10 +167,37 @@ class CapitalTransactionListCreateView(generics.ListCreateAPIView):
         withdrawals = qs.filter(transaction_type='withdraw').aggregate(Sum('amount'))['amount__sum'] or 0
         balance = deposits - withdrawals
 
+        # Guard: positive amount only
+        if amount is None or amount <= 0:
+            raise serializers.ValidationError("Amount must be greater than 0.")
+
+        # Guard: withdrawal cannot exceed available cash-on-hand
         if transaction_type == 'withdraw' and amount > balance:
             raise serializers.ValidationError("❌ Insufficient capital for this withdrawal.")
 
-        serializer.save(account_id=acct)  # <-- IMPORTANT
+        # Save capital row and (if withdraw) mirror a bank deposit atomically
+        with transaction.atomic():
+            ct: CapitalTransaction = serializer.save(account_id=acct)
+
+            # ---- Normalize remarks for transfers so they don't change Owner's Capital ----
+            # We want remarks to contain "transfer" (and optionally "bank") so compute_owner_capital()
+            # will exclude this row from owner equity.
+            if transaction_type == 'withdraw' and acct:
+                rm = (ct.remarks or "").strip()
+                if "transfer" not in rm.lower():
+                    # Standardize the note; keep any user-provided note at the end
+                    rm = f"Transfer to bank{': ' + rm if rm else ''}"
+                    ct.remarks = rm
+                    ct.save(update_fields=["remarks"])
+
+                # Mirror to bank: capital WITHDRAW becomes a BANK DEPOSIT
+                BankTransaction.objects.create(
+                    account_id=acct,
+                    transaction_type='deposit',
+                    amount=amount,
+                    remarks=rm or "Transfer to bank from capital",
+                    date=ct.date  # keep timestamps aligned
+                )
 
 
 # THIS VIEW FOR STOCK IN PRODUCTS ( STOCK - IN ) ----------------------------------------------------------------------------------------------------------------------------------------
@@ -1303,7 +1332,9 @@ def transactions_list(request):
                 "stock-in" in rm or
                 "deleted product" in rm or
                 "cash sale" in rm or
-                "customer payment" in rm
+                "customer payment" in rm or
+                "transfer" in rm or     # ✅ hide transfers
+                "bank" in rm            # ✅ hide bank moves
             ):
                 continue  # skip anything system-generated
 
@@ -1841,4 +1872,106 @@ def categories_list(request):
           .distinct())
 
     return Response(list(qs), status=200)
+
+@require_GET
+def wallet_balance(request):
+    """
+    GET /api/wallet/?account_id=123
+    Returns {"balance": 123.45}
+    """
+    account_id = request.GET.get('account_id')
+    if not account_id:
+        return JsonResponse({'error': 'account_id is required'}, status=400)
+
+    try:
+        account_id = int(account_id)
+    except ValueError:
+        return JsonResponse({'error': 'account_id must be an integer'}, status=400)
+
+    agg = CapitalTransaction.objects.filter(account_id=account_id).aggregate(
+        bal=Sum(
+            Case( # type: ignore
+                When(transaction_type='deposit', then=F('amount')),
+                When(transaction_type='withdraw', then=-F('amount')),
+                default=Decimal('0'),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
+            )
+        )
+    )
+    balance = agg['bal'] or Decimal('0')
+    return JsonResponse({'balance': float(balance)})
+
+
+def _cashbook_balance(account_id: int) -> Decimal:
+    """
+    Sum deposits - withdrawals from CapitalTransaction for a given account.
+    This is the same math you already use for /wallet/ and /capital/balance/.
+    """
+    agg = CapitalTransaction.objects.filter(account_id=account_id).aggregate(
+        bal=Sum(
+            Case(
+                When(transaction_type='deposit',  then=F('amount')),
+                When(transaction_type='withdraw', then=-F('amount')),
+                default=Decimal('0'),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
+            )
+        )
+    )
+    return agg['bal'] or Decimal('0')
+
+
+# -- helpers to separate equity from operational cash --
+OWNER_SYSTEM_KEYWORDS = [
+    # anything system-generated we do NOT want counted as owner equity
+    'cash sale', 'customer payment', 'expense', 'payable',
+    'downpayment', 'stock-in', 'deleted product','transfer','bank'
+]
+
+def compute_owner_capital(account_id: int) -> Decimal:
+    """
+    Owner contributions - owner withdrawals.
+    Excludes system-generated cashbook rows so equity != cashbook.
+    """
+    qs = CapitalTransaction.objects.filter(account_id=account_id)
+    for kw in OWNER_SYSTEM_KEYWORDS:
+        qs = qs.exclude(remarks__icontains=kw)
+
+    deposits = qs.filter(transaction_type='deposit').aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    withdrawals = qs.filter(transaction_type='withdraw').aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    return (deposits - withdrawals) or Decimal('0')
+
+
+def compute_bank_balance(account_id: int) -> Decimal:
+    qs = BankTransaction.objects.filter(account_id=account_id)
+    deposits = qs.filter(transaction_type='deposit').aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    withdrawals = qs.filter(transaction_type='withdraw').aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    return (deposits - withdrawals) or Decimal('0')
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def cash_breakdown(request):
+    account_id = request.GET.get('account_id')
+    if not account_id:
+        return Response({'detail': 'account_id is required'}, status=400)
+    try:
+        account_id = int(account_id)
+    except ValueError:
+        return Response({'detail': 'account_id must be an integer'}, status=400)
+
+    cash_on_hand = _cashbook_balance(account_id)       # Decimal
+    cash_on_bank = compute_bank_balance(account_id)    # Decimal
+    owner_cap    = compute_owner_capital(account_id)   # Decimal
+
+    total_cash = cash_on_hand + cash_on_bank
+
+    return Response({
+        'cash_on_hand': float(cash_on_hand),
+        'cash_on_bank': float(cash_on_bank),
+        'capital':      float(owner_cap),              # ✅ not the cashbook
+        'total_cash':   float(total_cash),
+    }, status=200)
+
+
+
 

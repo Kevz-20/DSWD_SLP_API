@@ -10,7 +10,7 @@ from rest_framework.exceptions import ValidationError
 
 from .models import (
     Account, CapitalTransaction, Expense, Product, Sale, SaleItem,
-    StockIn, SalesCash, Customer, SalesCredit, Payable, PayablePayment
+    StockIn, SalesCash, Customer, SalesCredit, Payable, PayablePayment,BankTransaction,
 )
 
 # ==========================
@@ -769,3 +769,70 @@ class PayablePaymentSerializer(serializers.ModelSerializer):
             "description": tx.remarks or "",
             "date": tx.date.isoformat()
         }
+
+
+class CashBreakdownSerializer(serializers.Serializer):
+    cash_on_hand = serializers.DecimalField(max_digits=12, decimal_places=2)
+    capital      = serializers.DecimalField(max_digits=12, decimal_places=2)
+    cash_on_bank = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+def _dec(v) -> Decimal:
+    try:
+        return Decimal(v)
+    except Exception:
+        return Decimal("0.00")
+
+def compute_capital_balance(account_id: int) -> Decimal:
+    """
+    deposits - withdraws from CapitalTransaction
+    """
+    agg = CapitalTransaction.objects.filter(account_id=account_id).aggregate(
+        bal=Sum(
+            Case(
+                When(transaction_type='deposit', then=F('amount')),
+                When(transaction_type='withdraw', then=-F('amount')),
+                default=0,
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            )
+        )
+    )
+    return _dec(agg['bal'] or 0)
+
+def compute_cash_on_hand(account_id: int) -> Decimal:
+    """
+    Simple assumption:
+    cash on hand = sum(SalesCash.amount) - sum(Expense.amount)
+    Tweak this if your business rule differs.
+    """
+    sales = SalesCash.objects.filter(account_id=account_id)\
+            .aggregate(total=Coalesce(Sum('amount'), 0))['total'] or 0
+    exps  = Expense.objects.filter(account_id=account_id)\
+            .aggregate(total=Coalesce(Sum('amount'), 0))['total'] or 0
+    return _dec(sales) - _dec(exps)
+
+
+def compute_cash_on_bank(account_id: int) -> Decimal:
+    """
+    Cash on bank = sum(deposits) - sum(withdrawals) from BankTransaction.
+    """
+    agg = BankTransaction.objects.filter(account_id=account_id).aggregate(
+        bal=Sum(
+            Case(
+                When(transaction_type='deposit', then=F('amount')),
+                When(transaction_type='withdraw', then=-F('amount')),
+                default=0,
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            )
+        )
+    )
+    return _dec(agg['bal'] or 0)
+
+
+def get_cash_breakdown_data(account_id: int) -> dict:
+    data = {
+        "cash_on_hand": compute_cash_on_hand(account_id),
+        "capital":      compute_capital_balance(account_id),
+        "cash_on_bank": compute_cash_on_bank(account_id),
+    }
+    # Serialize to ensure proper formatting (2dp)
+    return CashBreakdownSerializer(data).data
