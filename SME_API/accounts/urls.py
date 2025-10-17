@@ -67,6 +67,8 @@ urlpatterns = [
     path('', include(router.urls)),
 
     path('finance/cash-breakdown/', views.cash_breakdown, name='cash_breakdown'),
+    path('finance/transfer-to-bank/', views.transfer_to_bank, name='transfer_to_bank'),
 
+    path("balance-assets/", views.balance_assets, name="balance-assets"),
     # FINALIZE
 ]

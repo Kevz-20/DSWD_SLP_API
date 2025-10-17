@@ -14,6 +14,12 @@ from django.utils import timezone
 from django.contrib.auth.hashers import make_password, check_password
 import uuid
 from datetime import timedelta
+from decimal import Decimal
+from calendar import monthrange
+from datetime import date
+from django.core.validators import MinValueValidator
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 
 SECURITY_QUESTIONS = {
     101: "Unsa ang una nimo negosyo?",
@@ -203,6 +209,21 @@ class Expense(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class FixedAsset(models.Model):
+    account = models.ForeignKey('Account', on_delete=models.CASCADE, related_name='fixed_assets')
+    name = models.CharField(max_length=255)
+    category = models.CharField(max_length=50, default='equipment')
+    cost = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(0)])
+    date_acquired = models.DateField(default=timezone.localdate)
+    accumulated_depreciation = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.name} ₱{self.cost}"
+
+
 # ----------------- STOCK IN -----------------
 class StockIn(models.Model):
     account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)  # temporary
@@ -311,11 +332,26 @@ class SalesCredit(models.Model):
 class Payable(models.Model):
     account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name="payables")
     supplier_name = models.CharField(max_length=255)
+
+    # NEW: what the payable is for (e.g., “Freezer”)
+    item = models.CharField(max_length=255, blank=True, default="")
+
     original_amount = models.DecimalField(max_digits=12, decimal_places=2)
     remaining_amount = models.DecimalField(max_digits=12, decimal_places=2)
     due_date = models.DateField(null=True, blank=True)
     note = models.TextField(blank=True, default="")
     is_paid = models.BooleanField(default=False)
+
+    # === NEW: installment plan fields (all optional / nullable for backward compat) ===
+    has_plan = models.BooleanField(default=False)
+    plan_months = models.PositiveIntegerField(null=True, blank=True)
+    plan_monthly = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    first_due_date = models.DateField(null=True, blank=True)
+    next_due_date = models.DateField(null=True, blank=True)
+
+    # === NEW: mark this payable as an asset purchase (optional) ===
+    is_asset = models.BooleanField(default=False)
+    asset_category = models.CharField(max_length=50, blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -323,13 +359,135 @@ class Payable(models.Model):
     def __str__(self):
         return f"{self.supplier_name} - ₱{self.remaining_amount}"
 
+    @property
+    def is_overdue(self):
+        d = self.next_due_date or self.due_date
+        return bool(d and d < timezone.localdate() and self.remaining_amount > 0)
+
+    @property
+    def next_installment_amount(self):
+        if self.has_plan and self.plan_monthly:
+            return min(self.plan_monthly, self.remaining_amount)
+        return self.remaining_amount
+
+    def save(self, *args, **kwargs):
+        # keep is_paid in sync and seed next_due_date for plans (no change to other behavior)
+        self.is_paid = (self.remaining_amount or 0) <= 0
+        if self.has_plan and not self.next_due_date:
+            self.next_due_date = self.first_due_date or self.due_date
+        super().save(*args, **kwargs)
+
+
 
 class PayablePayment(models.Model):
     payable = models.ForeignKey(Payable, on_delete=models.CASCADE, related_name="payments")
-    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(0.01)])
     date = models.DateField()
     note = models.CharField(max_length=255, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"Payment ₱{self.amount} for {self.payable.supplier_name}"
+
+    def _add_one_month(self, d: date) -> date: # type: ignore
+        y = d.year + (1 if d.month == 12 else 0)
+        m = 1 if d.month == 12 else d.month + 1
+        day = min(d.day, monthrange(y, m)[1])
+        return date(y, m, day)
+
+    def save(self, *args, **kwargs):
+        creating = self.pk is None
+        super().save(*args, **kwargs)
+        if creating:
+            p = self.payable
+            p.remaining_amount = max(Decimal(p.remaining_amount) - Decimal(self.amount), Decimal('0'))
+            if p.has_plan:
+                if p.next_due_date:
+                    p.next_due_date = self._add_one_month(p.next_due_date)
+                elif p.first_due_date:
+                    p.next_due_date = p.first_due_date
+                elif p.due_date:
+                    p.next_due_date = p.due_date
+            if p.remaining_amount <= 0:
+                p.is_paid = True
+                p.next_due_date = None
+            p.save(update_fields=['remaining_amount', 'next_due_date', 'is_paid', 'updated_at'])
+
+
+
+class Transaction(models.Model):
+    """
+    Unified transaction log used by the Transaction History screen.
+    A 'transfer to bank' will create TWO rows sharing the same group_id:
+    - transfer_cash_out (source=cash, destination=bank)
+    - transfer_bank_in  (source=cash, destination=bank)
+    """
+    TYPE_CHOICES = [
+        ('capital_deposit', 'Capital Deposit'),
+        ('transfer_cash_out', 'Transfer - Cash Out'),
+        ('transfer_bank_in', 'Transfer - Bank In'),
+    ]
+    SOURCE_CHOICES = [
+        ('cash', 'Cash On Hand'),
+        ('bank', 'Cash In Bank'),
+        ('capital', 'Capital'),
+    ]
+
+    account = models.ForeignKey('Account', on_delete=models.CASCADE, related_name='transactions')
+    date = models.DateTimeField(default=timezone.now, db_index=True)
+    type = models.CharField(max_length=32, choices=TYPE_CHOICES)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    source = models.CharField(max_length=16, choices=SOURCE_CHOICES, null=True, blank=True)
+    destination = models.CharField(max_length=16, choices=SOURCE_CHOICES, null=True, blank=True)
+    remarks = models.TextField(blank=True, null=True)
+    group_id = models.UUIDField(default=uuid.uuid4, db_index=True)  # tie related rows (e.g., transfers)
+
+    class Meta:
+        ordering = ['-date', '-id']
+
+    def __str__(self):
+        return f"{self.type} ₱{self.amount} (acct {self.account_id})"
+    
+
+    # ----------------- BALANCE ASSETS -----------------
+class BalanceAssets(models.Model):
+    """
+    Holds the summarized asset values per account.
+    This model is updated whenever capital, bank, payable, or other
+    asset-related transactions occur, to make balance sheet generation faster.
+    """
+
+    account = models.OneToOneField(
+        'Account',
+        on_delete=models.CASCADE,
+        related_name='balance_assets'
+    )
+
+    # 🔹 Basic current assets
+    cash_on_hand = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    cash_in_bank = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    accounts_receivable = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    inventory = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    # 🔹 Fixed / Long-term assets
+    fixed_assets = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    # 🔹 Computed fields for reporting
+    @property
+    def total_assets(self):
+        """Total of all asset categories."""
+        return (
+            (self.cash_on_hand or 0)
+            + (self.cash_in_bank or 0)
+            + (self.accounts_receivable or 0)
+            + (self.inventory or 0)
+            + (self.fixed_assets or 0)
+        )
+
+    def __str__(self):
+        return f"Assets (acct {self.account_id}) ₱{self.total_assets:,.2f}"
+
+    class Meta:
+        verbose_name = "Balance Sheet - Assets"
+        verbose_name_plural = "Balance Sheet - Assets"
+
