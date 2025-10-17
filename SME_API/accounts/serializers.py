@@ -7,6 +7,7 @@ from django.db.models import Sum, Case, When, F, DecimalField  # type: ignore
 from django.db.models.functions import Coalesce
 from rest_framework import serializers  # type: ignore
 from rest_framework.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 
 from .models import (
     Account,
@@ -761,28 +762,42 @@ class PayableCreateSerializer(serializers.ModelSerializer):
 
 
 class PayablePaymentSerializer(serializers.ModelSerializer):
-    # Optional label to show in the cash ledger "Payment - <item_label>"
+    # Optional label for cash ledger
     item_label = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    # Client-sent idempotency key to guard against double taps/retries
+    idempotency_key = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
-    # Read-only extras so the client can refresh UI immediately
+    # Read-only extras for client refresh
     new_balance = serializers.SerializerMethodField(read_only=True)
     transaction = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = PayablePayment
-        fields = ['id', 'payable', 'amount', 'date', 'note', 'created_at',
-                  'item_label', 'new_balance', 'transaction']
+        fields = [
+            'id', 'payable', 'amount', 'date', 'note', 'created_at',
+            'item_label', 'idempotency_key',
+            'new_balance', 'transaction'
+        ]
         read_only_fields = ['id', 'created_at', 'new_balance', 'transaction']
 
+    # Prefer a payable locked by the view; fall back to attrs['payable']
+    def _get_locked_payable(self, attrs):
+        return self.context.get("payable_locked") or attrs.get('payable')
+
     def validate(self, attrs):
-        payable = attrs['payable']
-        amount = attrs['amount']
+        payable = self._get_locked_payable(attrs)
+        amount = attrs.get('amount')
+
+        if payable is None:
+            raise serializers.ValidationError("Payable is required.")
         if payable.is_paid:
             raise serializers.ValidationError("This payable is already marked as paid.")
-        if amount <= 0:
+        if amount is None or amount <= 0:
             raise serializers.ValidationError("Amount must be greater than 0.")
-        if amount > payable.remaining_amount:
-            raise serializers.ValidationError("Payment exceeds remaining amount.")
+
+        remaining = Decimal(payable.remaining_amount or 0)
+        if Decimal(amount) > remaining:
+            raise serializers.ValidationError(f"Payment exceeds remaining amount (₱{remaining:,.2f}).")
         return attrs
 
     def _compute_cash_balance(self, account_id=None):
@@ -794,56 +809,67 @@ class PayablePaymentSerializer(serializers.ModelSerializer):
                 Case(
                     When(transaction_type='deposit', then=F('amount')),
                     When(transaction_type='withdraw', then=-F('amount')),
-                    default=0,
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
+                    default=Decimal('0'),
+                    output_field=DecimalField(max_digits=14, decimal_places=2)
                 )
             )
-        )['bal'] or 0)
+        )['bal'] or Decimal('0'))
 
     def create(self, validated_data):
-        # Pop write-only extras
+        # Pull write-only extras
         item_label = (validated_data.pop('item_label', '') or '').strip()
+        idem_key   = (validated_data.pop('idempotency_key', '') or '').strip() or None
 
-        # 1) Create the payment
-        payment = super().create(validated_data)
+        # Always work with the locked payable if provided
+        payable = self._get_locked_payable(validated_data)
+        if payable is None:
+            raise serializers.ValidationError("Payable is required.")
 
-        # 2) Update the payable
-        p = payment.payable
-        p.remaining_amount = p.remaining_amount - payment.amount
-        if p.remaining_amount <= 0:
-            p.remaining_amount = Decimal('0.00')
-            p.is_paid = True
-        p.save(update_fields=['remaining_amount', 'is_paid', 'updated_at'])
+        amount = Decimal(validated_data['amount'])
 
-        # 3) Mirror to cash ledger as WITHDRAW
-        label = item_label or p.supplier_name
-        # Align the ledger timestamp to the payment date (start of day, aware)
-        pay_dt = dt_datetime.combine(payment.date, dt_time.min)
+        with transaction.atomic():
+            try:
+                # ✅ Create the payment ONLY. The PayablePayment.save() model method
+                #    will clamp overpay, decrement remaining_amount, advance next_due_date,
+                #    and close the payable when needed. No manual AP math here.
+                payment = PayablePayment.objects.create(
+                    payable=payable,
+                    amount=amount,
+                    note=validated_data.get('note') or '',
+                    date=validated_data.get('date'),
+                    idempotency_key=idem_key,
+                )
+            except IntegrityError:
+                # Duplicate (payable, idempotency_key)
+                raise serializers.ValidationError({"idempotency_key": "Duplicate payment."})
 
-        tx = CapitalTransaction.objects.create(
-            account=p.account,
-            amount=payment.amount,
-            transaction_type='withdraw',
-            remarks=f"Payable payment - {label}",
-            date=pay_dt
-        )
+            # Mirror to cash ledger (withdraw) at the payment date (start of day).
+            # Use the actual saved amount (may be clamped by model.save()).
+            label = item_label or payable.supplier_name
+            pay_dt = dt_datetime.combine(payment.date, dt_time.min)
 
-        # 4) Cache for SerializerMethodField getters
-        self._tx = tx
-        self._new_balance = self._compute_cash_balance(account_id=p.account_id)
+            tx = CapitalTransaction.objects.create(
+                account=payable.account,
+                amount=payment.amount,
+                transaction_type='withdraw',
+                remarks=f"Payable payment - {label}",
+                date=pay_dt
+            )
+
+            # Cache for SerializerMethodFields
+            self._tx = tx
+            self._new_balance = self._compute_cash_balance(account_id=payable.account_id)
 
         return payment
 
     # === Read-only fields for response ===
     def get_new_balance(self, obj):
-        # Prefer cached value from create(); fallback compute (e.g., when used for GET)
         if hasattr(self, '_new_balance'):
             return float(self._new_balance)
         p = obj.payable
         return float(self._compute_cash_balance(account_id=p.account_id))
 
     def get_transaction(self, obj):
-        # Small preview block for client UI
         tx = getattr(self, '_tx', None)
         if not tx:
             return {
@@ -881,8 +907,18 @@ def _dec(v) -> Decimal:
 def compute_capital_balance(account_id: int) -> Decimal:
     """
     deposits - withdraws from CapitalTransaction
+    Exclude system withdrawals like payable payments, stock-in, expenses, etc.
     """
-    agg = CapitalTransaction.objects.filter(account_id=account_id).aggregate(
+    qs = CapitalTransaction.objects.filter(account_id=account_id)
+
+    # Exclude system-related remarks (not actual owner withdrawals)
+    qs = qs.exclude(remarks__icontains='payable')
+    qs = qs.exclude(remarks__icontains='stock-in')
+    qs = qs.exclude(remarks__icontains='expense')
+    qs = qs.exclude(remarks__icontains='customer payment')
+    qs = qs.exclude(remarks__icontains='transfer')
+
+    agg = qs.aggregate(
         bal=Sum(
             Case(
                 When(transaction_type='deposit', then=F('amount')),
@@ -893,6 +929,7 @@ def compute_capital_balance(account_id: int) -> Decimal:
         )
     )
     return _dec(agg['bal'] or 0)
+
 
 
 def compute_cash_on_hand(account_id: int) -> Decimal:

@@ -82,6 +82,12 @@ class Account(models.Model):
     def security_question_text(self) -> str:
         return SECURITY_QUESTIONS.get(self.security_question_id, "")
     
+    @property
+    def full_name(self) -> str:
+        """Return 'First Middle Last' (skips blanks/None)."""
+        return " ".join(x for x in [self.first_name, self.middle_name, self.last_name] if x).strip()
+
+    
 
 class ForgotPinToken(models.Model):
     phone_number = models.CharField(max_length=11)
@@ -384,12 +390,25 @@ class PayablePayment(models.Model):
     amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(0.01)])
     date = models.DateField()
     note = models.CharField(max_length=255, blank=True, default="")
+    # NEW: avoid duplicate records from retries / double taps
+    idempotency_key = models.CharField(max_length=64, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # Unique *when* a key is provided
+            models.UniqueConstraint(
+                fields=['payable', 'idempotency_key'],
+                name='uq_payable_idempotency',
+                condition=~models.Q(idempotency_key=None),
+            )
+        ]
 
     def __str__(self):
         return f"Payment ₱{self.amount} for {self.payable.supplier_name}"
 
     def _add_one_month(self, d: date) -> date: # type: ignore
+        from calendar import monthrange
         y = d.year + (1 if d.month == 12 else 0)
         m = 1 if d.month == 12 else d.month + 1
         day = min(d.day, monthrange(y, m)[1])
@@ -397,10 +416,20 @@ class PayablePayment(models.Model):
 
     def save(self, *args, **kwargs):
         creating = self.pk is None
+
+        # 🔒 Clamp on create so we never overpay
+        if creating:
+            remaining = Decimal(self.payable.remaining_amount or 0)
+            if self.amount > remaining:
+                self.amount = remaining
+
         super().save(*args, **kwargs)
+
+        # Apply effects exactly once
         if creating:
             p = self.payable
             p.remaining_amount = max(Decimal(p.remaining_amount) - Decimal(self.amount), Decimal('0'))
+
             if p.has_plan:
                 if p.next_due_date:
                     p.next_due_date = self._add_one_month(p.next_due_date)
@@ -408,10 +437,13 @@ class PayablePayment(models.Model):
                     p.next_due_date = p.first_due_date
                 elif p.due_date:
                     p.next_due_date = p.due_date
+
             if p.remaining_amount <= 0:
                 p.is_paid = True
                 p.next_due_date = None
+
             p.save(update_fields=['remaining_amount', 'next_due_date', 'is_paid', 'updated_at'])
+
 
 
 

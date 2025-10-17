@@ -15,7 +15,7 @@ from django.utils.dateparse import parse_date  # type: ignore
 from django.http import JsonResponse  # type: ignore
 from django.shortcuts import render  # type: ignore
 # ✅ Add Product and Stock-In (combined API)
-from django.db import transaction  # type: ignore
+from django.db import transaction, IntegrityError  # type: ignore
 from rest_framework.exceptions import ValidationError  # type: ignore
 from django.db.models import F, Sum, DecimalField, ExpressionWrapper  # type: ignore
 from decimal import Decimal, ROUND_HALF_UP
@@ -492,15 +492,15 @@ def delete_inventory(request):
 def record_expense(request):
     account_id = request.data.get('account_id')
     amount = Decimal(str(request.data.get('amount')))
-    category = request.data.get('category')
-    description = request.data.get('description')
+    category = (request.data.get('category') or '').strip() or 'Expense'
+    description = (request.data.get('description') or '').strip()
     payment_method = (request.data.get('payment_method') or 'cash').lower()  # 'cash' | 'bank' | 'credit'
     receipt = request.FILES.get('receipt')
 
     account = Account.objects.get(id=account_id)
 
     if payment_method in ('cash', 'bank'):
-        # CASH-BASIS: record expense now and mirror cash out
+        # CASH / BANK: record expense now and mirror cash out
         Expense.objects.create(
             account=account, amount=amount, category=category,
             description=description, receipt=receipt
@@ -515,20 +515,28 @@ def record_expense(request):
                 remarks=f"Expense: {category} - {description}"
             )
     else:
-        # CREDIT-BASIS: do NOT create an Expense row here.
-        # Create only a payable; expense will be recognized when paid.
+        # CREDIT (ACCRUAL): recognize the Expense now (affects NI today),
+        # and also create a Payable for the cash-out later.
+        Expense.objects.create(
+            account=account,
+            amount=amount,
+            category=category,              # keep the real category (e.g., 'Utilities')
+            description=f"{description} (on credit)" if description else "On credit",
+            receipt=receipt
+            # optional: add a flag in the model like hits_income=True for cleaner filters
+        )
         Payable.objects.create(
             account=account,
             supplier_name=category or 'Expense',
             original_amount=amount,
             remaining_amount=amount,
-            # let client pass due_date; fallback today
             due_date=parse_date(request.data.get('due_date')) or date.today(),
-            note=f"Expense on credit - {description}",
+            note=f"Expense on credit - {description}" if description else "Expense on credit",
             is_paid=False
         )
 
     return Response({'message': 'Recorded.'}, status=201)
+
 
 
 @api_view(['GET'])
@@ -1042,10 +1050,11 @@ def update_product_name(request, product_id):
 def get_full_name(request, phone_number):
     try:
         account = Account.objects.get(phone_number=phone_number)
-        full_name = f"{account.first_name} {account.middle_name} {account.last_name}"
-        return Response({"full_name": full_name}, status=status.HTTP_200_OK)
     except Account.DoesNotExist:
         return Response({"error": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    full_name = " ".join(x for x in [account.first_name, account.middle_name, account.last_name] if x).strip()
+    return Response({"full_name": full_name}, status=status.HTTP_200_OK)
 
 
 # THIS VIEW FOR UPDATING THE PIN -------------------------------------------------------------------------------------------------------------------
@@ -1079,7 +1088,7 @@ def revenue_report(request):
     if not start_date or not end_date or end_date < start_date:
         return Response({'error': 'Valid start_date and end_date are required.'}, status=400)
 
-    # CASH sales (immutable per line)
+    # CASH sales
     cash_qs = SalesCash.objects.filter(date__range=(start_date, end_date))
     if account_id:
         cash_qs = cash_qs.filter(account_id=account_id)
@@ -1102,7 +1111,7 @@ def revenue_report(request):
         )
     )["total"] or 0
 
-    # Collections during the period (cash received from utang)
+    # (Optional) Collections reported separately
     paid_qs = CapitalTransaction.objects.filter(
         transaction_type='deposit',
         remarks__icontains='Customer payment',
@@ -1112,7 +1121,7 @@ def revenue_report(request):
         paid_qs = paid_qs.filter(account_id=account_id)
     paid_credit_total = paid_qs.aggregate(total=Sum('amount'))['total'] or 0
 
-    # Unpaid credit that ORIGINATED in the period (remaining as of now)
+    # Unpaid credit originated in the period (for info)
     unpaid_qs = SalesCredit.objects.filter(
         status=0,
         credit_date__range=(start_date, end_date),
@@ -1121,7 +1130,7 @@ def revenue_report(request):
         unpaid_qs = unpaid_qs.filter(account_id=account_id)
     unpaid_credit_total = unpaid_qs.aggregate(total=Sum('amount'))['total'] or 0
 
-    # EXPENSES (exclude legacy "Inventory Purchase" and "Expense on Credit")
+    # EXPENSES (ACCRUAL): include credit expenses; exclude stock-in legacy rows
     def local_bounds(d):
         start_local = datetime.combine(d, dt_time.min)
         end_local = datetime.combine(d, dt_time.max)
@@ -1139,19 +1148,17 @@ def revenue_report(request):
         created_at__lte=end_dt_local
     )
 
-    # ⛔ exclude stock-in expense rows
+    # Exclude only Inventory Purchase if you still create such rows
     if hasattr(Expense, "INVENTORY_PURCHASE"):
         expenses_qs = expenses_qs.exclude(category=Expense.INVENTORY_PURCHASE)
     else:
         expenses_qs = expenses_qs.exclude(category__iexact="Inventory Purchase")
 
-    # ⛔ exclude credit (unpaid) expenses so IS stays cash-basis for expenses
-    expenses_qs = expenses_qs.exclude(category__iexact="Expense on Credit")
-
+    # DO NOT exclude "Expense on Credit" anymore (accrual)
     expenses_total = expenses_qs.aggregate(total=Sum('amount'))['total'] or 0
 
     total_revenue = (cash_sales_total or 0) + (credit_sales_total or 0)
-    cogs = 0  # policy: stock-in is expensed immediately (not via COGS)
+    cogs = 0
     gross_profit = total_revenue - cogs
     net_profit = gross_profit - (expenses_total or 0)
 
@@ -1186,7 +1193,6 @@ def expenses_summary(request):
         return Response({'error': 'Invalid date range.'}, status=400)
 
     def local_bounds(d):
-        # Naïve datetimes in local time because USE_TZ = False
         start_local = datetime.combine(d, dt_time.min)
         end_local = datetime.combine(d, dt_time.max)
         return start_local, end_local
@@ -1198,17 +1204,13 @@ def expenses_summary(request):
     if account_id:
         qs = qs.filter(account_id=account_id)
 
-    # ⛔ Exclude legacy stock-in rows
+    # Exclude only Inventory Purchase legacy rows (if any)
     if hasattr(Expense, "INVENTORY_PURCHASE"):
         qs = qs.exclude(category=Expense.INVENTORY_PURCHASE)
     else:
         qs = qs.exclude(category__iexact='Inventory Purchase')
 
-    # ⛔ Exclude expenses created on credit (not yet paid in cash/bank)
-    qs = qs.exclude(category__iexact='Expense on Credit')
-
-    # (Optional) If you also want to exclude bookkeeping mirror rows, uncomment:
-    # qs = qs.exclude(category__iexact='Payable Payment')
+    # DO NOT exclude 'Expense on Credit' (we’re accrual now)
 
     qs = qs.filter(created_at__gte=start_dt_local,
                    created_at__lte=end_dt_local)
@@ -1239,20 +1241,20 @@ def update_full_name_secure(request, phone_number):
     last = (request.data.get("last_name") or "").strip()
 
     if not pin:
-        return Response({"error": "PIN is required."}, status=400)
+        return Response({"error": "PIN is required."}, status=status.HTTP_400_BAD_REQUEST)
     if account.pin != pin:
-        return Response({"error": "Invalid PIN."}, status=403)
-
+        return Response({"error": "Invalid PIN."}, status=status.HTTP_403_FORBIDDEN)
     if not first or not last:
-        return Response({"error": "First and last name are required."}, status=400)
+        return Response({"error": "First and last name are required."}, status=status.HTTP_400_BAD_REQUEST)
 
     account.first_name = first
-    account.middle_name = middle  # may be ""
+    account.middle_name = middle or None  # normalize empty to None if you like
     account.last_name = last
-    account.save()
+    account.save(update_fields=["first_name", "middle_name", "last_name"])
 
-    return Response({"message": "Full name updated.",
-                     "full_name": account.full_name}, status=200)
+    full_name = " ".join(x for x in [account.first_name, account.middle_name, account.last_name] if x).strip()
+    return Response({"message": "Full name updated.", "full_name": full_name}, status=status.HTTP_200_OK)
+
 
 #----JESEL UPDATE 0923
 @api_view(['GET'])
@@ -2019,16 +2021,40 @@ class PayableViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['POST'])
     def record_payment(self, request, pk=None):
+        """
+        Body:
+        {
+            "amount": 1000,
+            "note": "optional",
+            "idempotency_key": "uuid-v4-... (optional but recommended)"
+        }
+        """
         payable = self.get_object()
         payload = request.data.copy()
         payload['payable'] = payable.id
 
-        with transaction.atomic():  # ✅ wrap in atomic
-            ser = PayablePaymentSerializer(data=payload)
-            ser.is_valid(raise_exception=True)
-            payment = ser.save()        
+        idem_key = (payload.get('idempotency_key') or '').strip() or None
 
-            payable.refresh_from_db()
+        try:
+            with transaction.atomic():
+                # Optional: enforce idempotency key if your model has a field for it
+                # If you add a unique_together(payable, idempotency_key) on PayablePayment,
+                # the create below will raise IntegrityError on duplicates.
+
+                # Re-fetch the payable row locked to avoid concurrent decrements
+                payable_locked = (Payable.objects
+                                .select_for_update()
+                                .get(id=payable.id))
+
+                ser = PayablePaymentSerializer(data=payload, context={"payable_locked": payable_locked})
+                ser.is_valid(raise_exception=True)
+                payment = ser.save()  # <-- only place that subtracts remaining_amount
+
+                # Refresh materialized values for the response
+                payable_locked.refresh_from_db()
+
+        except IntegrityError:
+            return Response({"detail": "Duplicate payment (idempotency)."}, status=status.HTTP_409_CONFLICT)
 
         return Response(PayablePaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
 
@@ -2077,23 +2103,18 @@ def balance_sheet(request):
     """
     GET /api/balance-sheet/?account=12
       Optional:
-        &as_of=YYYY-MM-DD                (point-in-time; "to date")
+        &as_of=YYYY-MM-DD
         or
-        &start=YYYY-MM-DD&end=YYYY-MM-DD (period; balances at end, NI for the period)
-      Also accepts start_date/end_date.
+        &start=YYYY-MM-DD&end=YYYY-MM-DD
 
+    Accrual basis for expenses:
+      - Expense rows (cash or credit) hit NI when created.
+      - Paying a payable does NOT affect NI (just cash ↓, AP ↓).
     Policy:
-      - Inventory = 0 (stock-in expensed immediately)
-      - Expenses are cash-basis:
-          * exclude legacy "Inventory Purchase"
-          * exclude "Expense on Credit" (unpaid)
-          * include actual cash out from PayablePayment
+      - Inventory = 0 (stock-in expensed immediately elsewhere by your policy)
     """
- 
-
     account_id = request.GET.get("account") or request.GET.get("account_id")
 
-    # Accept either as_of OR start/end
     as_of_s = request.GET.get("as_of")
     start_s = request.GET.get("start") or request.GET.get("start_date")
     end_s   = request.GET.get("end")   or request.GET.get("end_date")
@@ -2104,7 +2125,6 @@ def balance_sheet(request):
     if start and end and end < start:
         start, end = end, start
 
-    # helpers
     def scoped(qs):
         return qs.filter(account_id=account_id) if account_id else qs
 
@@ -2112,7 +2132,6 @@ def balance_sheet(request):
         return datetime.combine(dt, datetime.max.time())
 
     def as_of_date(qs, field, dt):
-        """All rows with field <= dt (end-of-day if DateTimeField)."""
         if not dt:
             return qs
         model_field = qs.model._meta.get_field(field)
@@ -2121,7 +2140,6 @@ def balance_sheet(request):
         return qs.filter(**{f"{field}__lte": end_of_day(dt)})
 
     def between_dates(qs, field, s, e):
-        """Rows with s <= field <= e (inclusive, end-of-day for DateTimeField)."""
         if not (s and e):
             return qs
         model_field = qs.model._meta.get_field(field)
@@ -2135,20 +2153,17 @@ def balance_sheet(request):
     def _sum(qs, field="amount"):
         return qs.aggregate(total=Sum(field))["total"] or Decimal("0")
 
-    # ------------ CASH (Assets) ------------
+    # ---- CASH (Assets)
     cutoff = as_of or end
-    cap_qs = scoped(CapitalTransaction.objects.all())
-    cap_qs = as_of_date(cap_qs, "date", cutoff) if cutoff else cap_qs
+    cap_qs = as_of_date(scoped(CapitalTransaction.objects.all()), "date", cutoff) if cutoff else scoped(CapitalTransaction.objects.all())
     cash_on_hand = _sum(cap_qs.filter(transaction_type="deposit")) - _sum(cap_qs.filter(transaction_type="withdraw"))
 
-    bank_qs = scoped(BankTransaction.objects.all())
-    bank_qs = as_of_date(bank_qs, "date", cutoff) if cutoff else bank_qs
+    bank_qs = as_of_date(scoped(BankTransaction.objects.all()), "date", cutoff) if cutoff else scoped(BankTransaction.objects.all())
     cash_in_bank = _sum(bank_qs.filter(transaction_type="deposit")) - _sum(bank_qs.filter(transaction_type="withdraw"))
 
-    # ------------ Revenue (for Net Income) ------------
+    # ---- Revenue (cash + credit at sale time)
     if start and end:
-        cash_sales = scoped(SalesCash.objects.all())
-        cash_sales = between_dates(cash_sales, "created_at", start, end)
+        cash_sales = between_dates(scoped(SalesCash.objects.all()), "created_at", start, end)
         revenue_cash = _sum(cash_sales, "amount")
 
         credit_items = SaleItem.objects.filter(sale__sale_type="utang")
@@ -2163,9 +2178,7 @@ def balance_sheet(request):
             output_field=DecimalField(max_digits=14, decimal_places=2)
         )))["total"] or Decimal("0")
     else:
-        # "To date"
-        cash_sales = scoped(SalesCash.objects.all())
-        cash_sales = as_of_date(cash_sales, "created_at", cutoff)
+        cash_sales = as_of_date(scoped(SalesCash.objects.all()), "created_at", cutoff) if cutoff else scoped(SalesCash.objects.all())
         revenue_cash = _sum(cash_sales, "amount")
 
         credit_items = SaleItem.objects.filter(sale__sale_type="utang")
@@ -2180,39 +2193,21 @@ def balance_sheet(request):
 
     total_revenue = revenue_cash + revenue_credit
 
-    # ------------ Operating Expenses (cash-basis) ------------
+    # ---- Operating Expenses (ACCRUAL: include credit expenses; exclude only stock-in)
     exp_qs = scoped(Expense.objects.all())
-    if start and end:
-        exp_qs = between_dates(exp_qs, "created_at", start, end)
-    else:
-        exp_qs = as_of_date(exp_qs, "created_at", cutoff) if cutoff else exp_qs
+    exp_qs = between_dates(exp_qs, "created_at", start, end) if (start and end) else (as_of_date(exp_qs, "created_at", cutoff) if cutoff else exp_qs)
 
-    # Exclude legacy stock-in rows
+    # Exclude only legacy stock-in rows if you still create them as Expense:
     if hasattr(Expense, "INVENTORY_PURCHASE"):
         exp_qs = exp_qs.exclude(category=Expense.INVENTORY_PURCHASE)
     else:
         exp_qs = exp_qs.exclude(category__iexact="Inventory Purchase")
 
-    # ❗Exclude unpaid credit stubs so they don't hit NI until paid
-    exp_qs = exp_qs.exclude(category__iexact="Expense on Credit")
-    # (Optional) If you’ve ever mirrored payable payments into Expense, keep them out
-    exp_qs = exp_qs.exclude(category__iexact="Payable Payment")
+    # IMPORTANT: Do NOT exclude "Expense on Credit" anymore.
+    # IMPORTANT: Do NOT add PayablePayment to expenses (payments don't hit NI).
+    operating_expenses = _sum(exp_qs, "amount")
 
-    expense_cash_rows = _sum(exp_qs, "amount")
-
-    # Include actual cash out for credit expenses via PayablePayment
-    pp_qs = PayablePayment.objects.select_related("payable")
-    if account_id:
-        pp_qs = pp_qs.filter(payable__account_id=account_id)
-    if start and end:
-        pp_qs = between_dates(pp_qs, "created_at", start, end)
-    else:
-        pp_qs = as_of_date(pp_qs, "created_at", cutoff) if cutoff else pp_qs
-    expense_payables_cash = _sum(pp_qs, "amount")
-
-    operating_expenses = expense_cash_rows + expense_payables_cash
-
-    # ------------ Receivables & Payables ------------
+    # ---- Receivables & Payables
     ar_qs = scoped(SalesCredit.objects.filter(amount__gt=0))
     date_field = "credit_date" if "credit_date" in [f.name for f in SalesCredit._meta.fields] else "created_at"
     ar_qs = as_of_date(ar_qs, date_field, cutoff) if cutoff else ar_qs
@@ -2223,13 +2218,13 @@ def balance_sheet(request):
     ap_qs = as_of_date(ap_qs, "created_at", cutoff) if cutoff else ap_qs
     accounts_payable = ap_qs.aggregate(total=Sum("remaining_amount"))["total"] or Decimal("0")
 
-    # ------------ NEW: Fixed Assets (payables flagged as assets) ------------
+    # Fixed assets via flagged payables
     fa_qs = scoped(Payable.objects.filter(is_asset=True))
     fa_qs = as_of_date(fa_qs, "created_at", cutoff) if cutoff else fa_qs
     fixed_assets = fa_qs.aggregate(total=Sum("original_amount"))["total"] or Decimal("0")
 
-    # ------------ Net Income & Equity ------------
-    cogs = Decimal("0")  # policy
+    # ---- Net Income & Equity
+    cogs = Decimal("0")  # per your current policy
     net_income = total_revenue - cogs - operating_expenses
 
     aid = int(account_id) if account_id else None
@@ -2237,11 +2232,10 @@ def balance_sheet(request):
     total_equity = capital_beginning + net_income
 
     total_cash = cash_on_hand + cash_in_bank
-    total_assets = total_cash + accounts_receivable + inventory + fixed_assets  # 👈 include fixed_assets
+    total_assets = total_cash + accounts_receivable + inventory + fixed_assets
     total_liabilities = accounts_payable
     balance_check = total_assets - (total_liabilities + total_equity)
 
-    # Subtitle / reported date line
     if start and end:
         report_date = f"{start.isoformat()} – {end.isoformat()}"
     elif cutoff:
@@ -2272,6 +2266,7 @@ def balance_sheet(request):
         "Total Liabilities + Equity": f"{(total_liabilities + total_equity):.2f}",
         "balance_check": f"{balance_check:.2f}",
     })
+
 
 
 
