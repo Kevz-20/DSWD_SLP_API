@@ -2562,3 +2562,89 @@ def cashflow_simple(request):
         "cash_end": round(cash_end, 2),
         "lines": lines,
     }, status=200)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def bank_balance(request):
+    """
+    GET /api/bank/?account_id=123
+    Returns {"balance": 123.45}
+    """
+    account_id = request.GET.get('account_id')
+    if not account_id:
+        return Response({'error': 'account_id is required'}, status=400)
+    try:
+        account_id = int(account_id)
+    except ValueError:
+        return Response({'error': 'account_id must be an integer'}, status=400)
+
+    bal = compute_bank_balance(account_id)  # you already have this helper
+    return Response({'balance': float(bal)}, status=200)
+
+@api_view(['POST'])
+def transfer_from_bank(request):
+    """
+    POST /api/finance/transfer-from-bank/
+    Body: { "account_id": 12, "amount": 123.45, "remarks": "optional" }
+
+    Effect:
+      - Creates BankTransaction(withdraw) with standardized "Transfer from bank ..." remark
+      - Creates CapitalTransaction(deposit) for the same amount
+      - Validates sufficient bank balance
+    """
+    # --- read & validate payload ---
+    try:
+        account_id = int(request.data.get('account_id'))
+    except (TypeError, ValueError):
+        return Response({'error': 'account_id is required and must be an integer'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        amount = Decimal(str(request.data.get('amount', 0))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    except Exception:
+        return Response({'error': 'Invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if amount <= 0:
+        return Response({'error': 'Amount must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user_note = (request.data.get('remarks') or '').strip()
+
+    bank_deposits = BankTransaction.objects.filter(account_id=account_id, transaction_type='deposit') \
+                                           .aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    bank_withdraws = BankTransaction.objects.filter(account_id=account_id, transaction_type='withdraw') \
+                                            .aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    bank_balance = bank_deposits - bank_withdraws
+
+    if amount > bank_balance:
+        return Response({'error': 'Insufficient bank balance.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    now = timezone.now()
+    std_remark = f"Transfer from bank{': ' + user_note if user_note else ''}"
+
+    # --- do the move atomically ---
+    with transaction.atomic():
+        # 1) bank withdraw
+        bank = BankTransaction.objects.create(
+            account_id=account_id,
+            amount=amount,
+            transaction_type='withdraw',
+            remarks=std_remark,
+            date=now
+        )
+        # 2) cashbook deposit
+        cap = CapitalTransaction.objects.create(
+            account_id=account_id,
+            amount=amount,
+            transaction_type='deposit',
+            remarks=std_remark,
+            date=now
+        )
+
+    return Response({
+        'ok': True,
+        'bank_tx_id': bank.id,
+        'capital_tx_id': cap.id,
+        'message': 'Transfer recorded successfully.'
+    }, status=status.HTTP_201_CREATED)
+

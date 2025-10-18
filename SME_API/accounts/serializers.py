@@ -926,6 +926,7 @@ class CashBreakdownSerializer(serializers.Serializer):
     cash_on_hand = serializers.DecimalField(max_digits=12, decimal_places=2)
     capital      = serializers.DecimalField(max_digits=12, decimal_places=2)
     cash_on_bank = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_cash   = serializers.DecimalField(max_digits=12, decimal_places=2)  
 
 
 def _dec(v) -> Decimal:
@@ -965,18 +966,33 @@ def compute_capital_balance(account_id: int) -> Decimal:
 
 def compute_cash_on_hand(account_id: int) -> Decimal:
     """
-    Policy A: cash on hand = CASH sales in - CASH expenses out.
-    Do not double-count PayablePayment because it already creates a
-    CapitalTransaction 'withdraw' (drawer).
+    Cash on hand =
+      (cash sales)
+    – (cash expenses)
+    – (capital 'withdraw' rows tagged as transfer → to bank)
+    + (capital 'deposit'  rows tagged as transfer ← from bank)
     """
     sales_cash = SalesCash.objects.filter(account_id=account_id)\
         .aggregate(total=Coalesce(Sum('amount'), 0))['total'] or 0
 
-    # If your Expense model has payment_method; otherwise remove this filter.
+    # If your Expense model has payment_method; otherwise remove the filter.
     cash_exp = Expense.objects.filter(account_id=account_id, payment_method='cash')\
         .aggregate(total=Coalesce(Sum('amount'), 0))['total'] or 0
 
-    return _dec(sales_cash) - _dec(cash_exp)
+    # Adjust for internal transfers recorded in CapitalTransaction
+    xfer_out = CapitalTransaction.objects.filter(
+        account_id=account_id,
+        transaction_type='withdraw',
+        remarks__icontains='transfer'
+    ).aggregate(total=Coalesce(Sum('amount'), 0))['total'] or 0
+
+    xfer_in = CapitalTransaction.objects.filter(
+        account_id=account_id,
+        transaction_type='deposit',
+        remarks__icontains='transfer'
+    ).aggregate(total=Coalesce(Sum('amount'), 0))['total'] or 0
+
+    return _dec(sales_cash) - _dec(cash_exp) - _dec(xfer_out) + _dec(xfer_in)
 
 
 def compute_cash_on_bank(account_id: int) -> Decimal:
@@ -1001,6 +1017,7 @@ def get_cash_breakdown_data(account_id: int) -> dict:
         "cash_on_hand": compute_cash_on_hand(account_id),
         "capital":      compute_capital_balance(account_id),
         "cash_on_bank": compute_cash_on_bank(account_id),
+        "total_cash":   on_hand + on_bank, # type: ignore
     }
     # Serialize to ensure proper formatting (2dp)
     return CashBreakdownSerializer(data).data

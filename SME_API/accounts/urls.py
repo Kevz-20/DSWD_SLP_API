@@ -50,6 +50,9 @@ urlpatterns = [
     path('capital/', CapitalTransactionListCreateView.as_view(), name='capital-transactions'),
     path('capital/balance/', views.get_current_capital_balance),
     path('wallet/', views.wallet_balance, name='wallet-balance'),
+    path('bank/', views.bank_balance, name='bank-balance'),
+    path('finance/transfer-from-bank/', views.transfer_from_bank, name='transfer_from_bank'),
+    
 
     # Expenses
     path('expenses/', views.list_expenses),
