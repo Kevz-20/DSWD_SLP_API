@@ -4,22 +4,22 @@ from django.core.validators import RegexValidator  # type: ignore
 from django.utils import timezone  # type: ignore
 
 # === NEW: imports for thumbnail generation (no other behavior changed) ===
-from PIL import Image
+from PIL import Image # type: ignore
 from io import BytesIO
-from django.core.files.base import ContentFile
+from django.core.files.base import ContentFile # type: ignore
 import os
 
-from django.db import models
-from django.utils import timezone
-from django.contrib.auth.hashers import make_password, check_password
+from django.db import models # type: ignore
+from django.utils import timezone # type: ignore
+from django.contrib.auth.hashers import make_password, check_password # type: ignore
 import uuid
 from datetime import timedelta
 from decimal import Decimal
 from calendar import monthrange
 from datetime import date
-from django.core.validators import MinValueValidator
-from django.db.models.signals import post_save
-from django.dispatch import receiver
+from django.core.validators import MinValueValidator # type: ignore
+from django.db.models.signals import post_save # type: ignore
+from django.dispatch import receiver # type: ignore
 
 SECURITY_QUESTIONS = {
     101: "Unsa ang una nimo negosyo?",

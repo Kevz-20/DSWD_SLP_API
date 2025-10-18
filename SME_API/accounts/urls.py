@@ -1,6 +1,6 @@
 # accounts/urls.py
-from django.urls import path, include
-from rest_framework.routers import DefaultRouter
+from django.urls import path, include # type: ignore
+from rest_framework.routers import DefaultRouter # type: ignore 
 from . import views
 from .views import CapitalTransactionListCreateView, PayableViewSet, ledger_pdf
 
@@ -61,6 +61,8 @@ urlpatterns = [
     path('transactions/', views.transactions_list, name='transactions_list'),
     path('balance-sheet/', views.balance_sheet, name='balance_sheet'),
     path('reports/ledger.pdf', ledger_pdf, name='ledger-pdf'),
+    path('reports/cashflow/', views.cashflow_simple, name='cashflow_report'),
+
 
     # Payables
     path('payables/summary/', views.payables_summary, name="payables_summary"),

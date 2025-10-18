@@ -4,7 +4,7 @@ from decimal import Decimal
 from datetime import datetime, date, time as dt_time
 from typing import List, Optional
 
-from django.utils import timezone
+from django.utils import timezone  # type: ignore
 
 from .models import (
     CapitalTransaction, SalesCash, SalesCredit, SalesCreditPayment,

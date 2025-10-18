@@ -4,7 +4,7 @@ from rest_framework.response import Response  # type: ignore  # ✅ Correct impo
 from rest_framework import status  # type: ignore  # ✅ Correct import
 from django.utils import timezone  # type: ignore  # ✅ Correct import
 from .models import Account, CapitalTransaction, Expense, Product, SaleItem, StockIn, SalesCash, Sale, SalesCredit, Customer, Account, Payable, PayablePayment,BankTransaction
-from .serializers import AccountSerializer, BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerCreateSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer, AccountNameSerializer, ExpenseSerializer, UpdateStockInSerializer, PayableSerializer, PayableCreateSerializer, PayablePaymentSerializer
+from .serializers import AccountSerializer, BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerCreateSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer, AccountNameSerializer, ExpenseSerializer, UpdateStockInSerializer, PayableSerializer, PayableCreateSerializer, PayablePaymentSerializer,compute_cashflow
 from datetime import date, time, datetime, time as dt_time, date as dt_date, timedelta
 from rest_framework import viewsets, generics  # type: ignore  # ✅ Correct import
 from django.db.models import Sum,Case,When  # type: ignore
@@ -22,19 +22,20 @@ from decimal import Decimal, ROUND_HALF_UP
 import time as pytime  # only if you use time.time() elsewhere (e.g., OR numbers)
 import time
 from django.core.exceptions import FieldError  # type: ignore
-from rest_framework.permissions import AllowAny
-from django.http import HttpResponse
+from rest_framework.permissions import AllowAny # type: ignore
+from django.http import HttpResponse # type: ignore
 from .reporting import build_journal
 from .pdf_ledger import render_ledger_pdf
-from django.db.models.functions import Lower
+from django.db.models.functions import Lower # type: ignore
 from .serializers import AccountCreateSerializer  # add this import
 from .serializers import ForgotStartSerializer, ForgotVerifySerializer, ForgotResetSerializer
 from .models import ForgotPinToken, SECURITY_QUESTIONS
-from django.views.decorators.http import require_GET
-from django.http import FileResponse
+from django.views.decorators.http import require_GET # type: ignore
+from django.http import FileResponse # type: ignore
 import tempfile
 from decimal import Decimal
-from django.db.models import Q
+from django.db.models import Q # type: ignore
+
 
 def _require_account_id(request) -> int:
     aid = request.GET.get('account_id') or request.data.get('account_id')
@@ -947,21 +948,12 @@ def edit_stockin_batch(request, batch_id):
 
 
 @api_view(['GET'])
-def get_product_batches(request):
-    """
-    GET /api/product-batches/?product_id=123&account=12
-    Returns remaining batches (qty > 0) for the product under the given account.
-    """
+def get_product_batches(request, product_id):  # ← accept path param
     account_id = request.GET.get('account') or request.GET.get('account_id')
-    product_id = request.GET.get('product_id')
-
     if not account_id:
         return Response({'error': 'account is required'}, status=400)
-    if not product_id:
-        return Response({'error': 'product_id is required'}, status=400)
 
     try:
-        # Optional: verify product belongs to this account
         product = Product.objects.get(id=product_id, account_id=account_id)
     except Product.DoesNotExist:
         return Response({'error': 'Product not found for this account'}, status=404)
@@ -1870,11 +1862,11 @@ def customer_debts(request, customer_id: int):
 
 
 from decimal import Decimal, ROUND_HALF_UP
-from django.db import transaction
-from django.utils import timezone
-from rest_framework.decorators import api_view
-from rest_framework.response import Response
-from rest_framework import status
+from django.db import transaction # type: ignore
+from django.utils import timezone # type: ignore
+from rest_framework.decorators import api_view # type: ignore
+from rest_framework.response import Response # type: ignore
+from rest_framework import status # type: ignore
 
 from .models import SalesCredit, CapitalTransaction
 
@@ -2008,6 +2000,9 @@ class PayableViewSet(viewsets.ModelViewSet):
         # else: all
 
         return qs
+    
+    
+
 
     @action(detail=True, methods=['POST']) # type: ignore
     def mark_paid(self, request, pk=None):
@@ -2464,4 +2459,106 @@ def balance_assets(request):
         "AccountsReceivable": float(receivables),
         "FixedAssets": float(fixed_assets),
         "TotalAssets": float(total_assets)
+    }, status=200)
+
+
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def cashflow_simple(request):
+    """
+    GET /api/reports/cashflow/?account=<id>&start=YYYY-MM-DD&end=YYYY-MM-DD
+    Returns only cash_in, cash_out, net, cash_begin, cash_end (+ optional lines).
+
+    Sources:
+      • CapitalTransaction (cash-on-hand)
+      • BankTransaction (cash-in-bank)
+
+    Rules:
+      • Include ALL deposits/withdrawals EXCEPT transfers ("transfer"/"bank" in remarks).
+      • This way, moving cash to bank (or vice versa) doesn't count as in/out.
+    """
+    account_id = request.GET.get('account') or request.GET.get('account_id')
+    start_s = request.GET.get('start') or request.GET.get('start_date')
+    end_s   = request.GET.get('end')   or request.GET.get('end_date')
+
+    if not account_id or not start_s or not end_s:
+        return Response({"detail": "account, start, and end are required (YYYY-MM-DD)."}, status=400)
+
+    try:
+        account_id = int(account_id)
+    except ValueError:
+        return Response({"detail": "account must be an integer"}, status=400)
+
+    start = parse_date(start_s)
+    end   = parse_date(end_s)
+    if not start or not end:
+        return Response({"detail": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+    if end < start:
+        start, end = end, start
+
+    def _sum(qs, field='amount') -> Decimal:
+        return qs.aggregate(total=Sum(field))['total'] or Decimal('0')
+
+    # ---------- balances BEFORE start (begin) ----------
+    cap_before = CapitalTransaction.objects.filter(account_id=account_id, date__lt=start)
+    bank_before = BankTransaction.objects.filter(account_id=account_id, date__lt=start)
+
+    cash_on_hand_begin = _sum(cap_before.filter(transaction_type='deposit')) - _sum(cap_before.filter(transaction_type='withdraw'))
+    cash_in_bank_begin = _sum(bank_before.filter(transaction_type='deposit')) - _sum(bank_before.filter(transaction_type='withdraw'))
+    cash_begin = cash_on_hand_begin + cash_in_bank_begin
+
+    # ---------- balances UP TO end (end) ----------
+    cap_to_end = CapitalTransaction.objects.filter(account_id=account_id, date__lte=end)
+    bank_to_end = BankTransaction.objects.filter(account_id=account_id, date__lte=end)
+
+    cash_on_hand_end = _sum(cap_to_end.filter(transaction_type='deposit')) - _sum(cap_to_end.filter(transaction_type='withdraw'))
+    cash_in_bank_end = _sum(bank_to_end.filter(transaction_type='deposit')) - _sum(bank_to_end.filter(transaction_type='withdraw'))
+    cash_end = cash_on_hand_end + cash_in_bank_end
+
+    # ---------- period range ----------
+    from datetime import datetime as _dt, time as _t
+    cap_range = CapitalTransaction.objects.filter(
+        account_id=account_id,
+        date__gte=_dt.combine(start, _t.min),
+        date__lte=_dt.combine(end, _t.max),
+    )
+    bank_range = BankTransaction.objects.filter(
+        account_id=account_id,
+        date__gte=_dt.combine(start, _t.min),
+        date__lte=_dt.combine(end, _t.max),
+    )
+
+    # Exclude transfers on both sides
+    def _no_transfer(qs):
+        return qs.exclude(remarks__icontains='transfer').exclude(remarks__icontains='bank')
+
+    cap_deposits    = _no_transfer(cap_range.filter(transaction_type='deposit'))
+    cap_withdrawals = _no_transfer(cap_range.filter(transaction_type='withdraw'))
+
+    bank_deposits    = _no_transfer(bank_range.filter(transaction_type='deposit'))
+    bank_withdrawals = _no_transfer(bank_range.filter(transaction_type='withdraw'))
+
+    cash_in  = _sum(cap_deposits) + _sum(bank_deposits)
+    cash_out = _sum(cap_withdrawals) + _sum(bank_withdrawals)
+    net = cash_in - cash_out
+
+    # Optional: simple lines so you can show details if you want
+    lines = [
+        {"group": "Cash In",  "label": "Cash-on-hand deposits", "amount": round(_sum(cap_deposits), 2)},
+        {"group": "Cash In",  "label": "Bank deposits",         "amount": round(_sum(bank_deposits), 2)},
+        {"group": "Cash Out", "label": "Cash withdrawals",      "amount": round(_sum(cap_withdrawals), 2)},
+        {"group": "Cash Out", "label": "Bank withdrawals",      "amount": round(_sum(bank_withdrawals), 2)},
+    ]
+
+    return Response({
+        "start": start_s,
+        "end": end_s,
+        "cash_in": round(cash_in, 2),
+        "cash_out": round(cash_out, 2),
+        "net": round(net, 2),
+        "cash_begin": round(cash_begin, 2),
+        "cash_end": round(cash_end, 2),
+        "lines": lines,
     }, status=200)
