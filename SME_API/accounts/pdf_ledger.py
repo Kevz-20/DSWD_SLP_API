@@ -1,11 +1,11 @@
 from io import BytesIO
 from datetime import datetime
 from decimal import Decimal
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.lib.colors import black
+from reportlab.pdfgen import canvas # type: ignore
+from reportlab.lib.pagesizes import A4 # type: ignore
+from reportlab.lib.units import mm # type: ignore
+from reportlab.lib import colors # type: ignore
+from reportlab.lib.colors import black # type: ignore
 
 PAGE_W, PAGE_H = A4
 LEFT   = 20 * mm

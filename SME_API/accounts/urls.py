@@ -64,7 +64,7 @@ urlpatterns = [
     path('transactions/', views.transactions_list, name='transactions_list'),
     path('balance-sheet/', views.balance_sheet, name='balance_sheet'),
     path('reports/ledger.pdf', ledger_pdf, name='ledger-pdf'),
-    path('reports/cashflow/', views.cashflow_simple, name='cashflow_report'),
+  
 
 
     # Payables

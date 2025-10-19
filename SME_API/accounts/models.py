@@ -197,6 +197,8 @@ class Sale(models.Model):
 
 
 # ----------------- EXPENSE -----------------
+# accounts/models.py
+
 class Expense(models.Model):
     INVENTORY_PURCHASE = "Inventory Purchase"
     CATEGORY_CHOICES = [
@@ -204,15 +206,22 @@ class Expense(models.Model):
         ("Rent", "Rent"),
         ("Utilities", "Utilities"),
         ("Other", "Other"),
+        # tip: if you often save these, add them too:
+        # ("Deleted Product", "Deleted Product"),
+        # ("Expense on Credit", "Expense on Credit"),
     ]
 
     account = models.ForeignKey(Account, on_delete=models.CASCADE)
     product = models.ForeignKey(Product, on_delete=models.SET_NULL, null=True, blank=True)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
-    category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)    # ⬅️ choices (optional)
-    description = models.TextField(blank=True, null=True)                   # ⬅️ allow blank
+    category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)
+    description = models.TextField(blank=True, null=True)
     receipt = models.ImageField(upload_to='receipts/', blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    # ✅ bring this back; DB column exists and is NOT NULL
+    is_fixed_asset = models.BooleanField(default=False)
+
 
 
 class FixedAsset(models.Model):

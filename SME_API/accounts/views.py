@@ -3,8 +3,8 @@ import uuid
 from rest_framework.response import Response  # type: ignore  # ✅ Correct import
 from rest_framework import status  # type: ignore  # ✅ Correct import
 from django.utils import timezone  # type: ignore  # ✅ Correct import
-from .models import Account, CapitalTransaction, Expense, Product, SaleItem, StockIn, SalesCash, Sale, SalesCredit, Customer, Account, Payable, PayablePayment,BankTransaction
-from .serializers import AccountSerializer, BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerCreateSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer, AccountNameSerializer, ExpenseSerializer, UpdateStockInSerializer, PayableSerializer, PayableCreateSerializer, PayablePaymentSerializer,compute_cashflow
+from .models import Account, BalanceAssets, CapitalTransaction, Expense, Product, SaleItem, StockIn, SalesCash, Sale, SalesCredit, Customer, Account, Payable, PayablePayment,BankTransaction
+from .serializers import AccountSerializer, BatchSerializer, AddProductStockInSerializer, CapitalTransactionSerializer, CustomerCreateSerializer, CustomerSerializer, DeleteInventorySerializer, ProductSerializer, SalesCashSerializer, SalesCreditRecordSerializer, AccountNameSerializer, ExpenseSerializer, UpdateStockInSerializer, PayableSerializer, PayableCreateSerializer, PayablePaymentSerializer
 from datetime import date, time, datetime, time as dt_time, date as dt_date, timedelta
 from rest_framework import viewsets, generics  # type: ignore  # ✅ Correct import
 from django.db.models import Sum,Case,When  # type: ignore
@@ -29,12 +29,31 @@ from .pdf_ledger import render_ledger_pdf
 from django.db.models.functions import Lower # type: ignore
 from .serializers import AccountCreateSerializer  # add this import
 from .serializers import ForgotStartSerializer, ForgotVerifySerializer, ForgotResetSerializer
-from .models import ForgotPinToken, SECURITY_QUESTIONS
+from .models import ForgotPinToken, SECURITY_QUESTIONS, FixedAsset
 from django.views.decorators.http import require_GET # type: ignore
 from django.http import FileResponse # type: ignore
 import tempfile
-from decimal import Decimal
+from decimal import Decimal 
 from django.db.models import Q # type: ignore
+from datetime import date as _dt_date, datetime as _dt_datetime
+from django.utils.dateparse import parse_date as _dj_parse_date # type: ignore
+
+def _coerce_date(value):
+    """
+    Accepts str|date|datetime|None and returns a date or None.
+    Returns None for empty/invalid strings.
+    """
+    if value is None:
+        return None
+    if isinstance(value, _dt_date) and not isinstance(value, _dt_datetime):
+        return value
+    if isinstance(value, _dt_datetime):
+        return value.date()
+    s = str(value).strip()
+    if not s:
+        return None
+    return _dj_parse_date(s)  # date or None
+
 
 
 def _require_account_id(request) -> int:
@@ -491,72 +510,186 @@ def delete_inventory(request):
 # THIS VIEW FOR RECORD EXPENSES BILLS, UTILITIES ETC ( RECORD EXPENSES ) -----------------------------------
 @api_view(['POST'])
 def record_expense(request):
-    account_id = request.data.get('account_id')
-    amount = Decimal(str(request.data.get('amount')))
-    category = (request.data.get('category') or '').strip() or 'Expense'
-    description = (request.data.get('description') or '').strip()
-    payment_method = (request.data.get('payment_method') or 'cash').lower()  # 'cash' | 'bank' | 'credit'
-    receipt = request.FILES.get('receipt')
+    """
+    Records an operating expense OR a fixed asset purchase.
 
-    account = Account.objects.get(id=account_id)
+    Rules:
+      • Fixed assets are recorded in FixedAsset (and as Payable if credit) — NOT in Expense.
+      • Cash/bank outflows are mirrored to CapitalTransaction (and BankTransaction for bank).
+      • For credit expenses (non-asset): create Expense + Payable (accrual basis).
+      • For credit fixed assets: create Payable(is_asset=True) + FixedAsset stub and bump BalanceAssets.
+    """
+    from decimal import Decimal
 
-    if payment_method in ('cash', 'bank'):
-        # CASH / BANK: record expense now and mirror cash out
-        Expense.objects.create(
-            account=account, amount=amount, category=category,
-            description=description, receipt=receipt
-        )
-        CapitalTransaction.objects.create(
-            account_id=account.id, amount=amount, transaction_type='withdraw',
-            remarks=f"Expense: {category} - {description}"
-        )
-        if payment_method == 'bank':
-            BankTransaction.objects.create(
-                account_id=account.id, amount=amount, transaction_type='withdraw',
-                remarks=f"Expense: {category} - {description}"
+    # --- Validate account_id ---
+    try:
+        account_id = int(request.data.get('account_id'))
+    except (TypeError, ValueError):
+        return Response({'error': 'account_id is required and must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # --- Validate amount ---
+    try:
+        amount = Decimal(str(request.data.get('amount'))).quantize(Decimal('0.01'))
+    except Exception:
+        return Response({'error': 'Invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
+    if amount <= 0:
+        return Response({'error': 'Amount must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # --- Inputs ---
+    raw_category   = (request.data.get('category') or '').strip()
+    description    = (request.data.get('description') or '').strip()
+    payment_method = (request.data.get('payment_method') or 'cash').strip().lower()  # 'cash'|'bank'|'credit'
+    receipt        = request.FILES.get('receipt')
+
+    # credit-only
+    raw_due  = request.data.get('due_date')
+    due_date = _coerce_date(raw_due)
+    if raw_due not in (None, '',) and due_date is None:
+        return Response({'error': 'Invalid due_date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # fetch account
+    try:
+        account = Account.objects.get(id=account_id)
+    except Account.DoesNotExist:
+        return Response({'error': 'Account not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    # 🔎 Categories that should be treated as Fixed Assets (case-insensitive exact match)
+    FIXED_ASSET_KEYS = {
+        'fixed assets (equipment/assets)',
+        'fixed assets',
+        'fixed asset',
+        'equipment',
+        'equipment/assets',
+        'assets',
+    }
+    is_fixed_asset = raw_category.lower() in FIXED_ASSET_KEYS
+
+    # -------------------- FIXED ASSET PATH --------------------
+    if is_fixed_asset:
+        asset_name     = description or raw_category or 'Fixed Asset'
+        asset_category = 'equipment'  # adjust as needed
+
+        if payment_method in ('cash', 'bank'):
+            # 1) Create FixedAsset
+            FixedAsset.objects.create(
+                account=account,
+                name=asset_name,
+                category=asset_category,
+                cost=amount,
+                date_acquired=timezone.now().date(),
             )
-    else:
-        # CREDIT (ACCRUAL): recognize the Expense now (affects NI today),
-        # and also create a Payable for the cash-out later.
+
+            # 2) Update BalanceAssets materialized tally
+            assets_row, _ = BalanceAssets.objects.get_or_create(account=account)
+            assets_row.fixed_assets = (assets_row.fixed_assets or Decimal('0')) + amount
+            assets_row.save(update_fields=['fixed_assets'])
+
+            # 3) Mirror outflow to cash/bank ledgers
+            CapitalTransaction.objects.create(
+                account=account,
+                amount=amount,
+                transaction_type='withdraw',
+                remarks=f"Fixed Asset: {asset_name} ({asset_category})"
+            )
+            if payment_method == 'bank':
+                BankTransaction.objects.create(
+                    account=account,
+                    amount=amount,
+                    transaction_type='withdraw',
+                    remarks=f"Fixed Asset: {asset_name} ({asset_category})"
+                )
+
+            # ✅ No Expense row for assets
+            return Response({'message': 'Fixed asset recorded.'}, status=status.HTTP_201_CREATED)
+
+        # --- CREDIT: record as Payable(is_asset=True); also create a FixedAsset stub; bump BalanceAssets ---
+        Payable.objects.create(
+            account=account,
+            supplier_name=asset_name or 'Fixed Asset',
+            item=asset_name,
+            original_amount=amount,
+            remaining_amount=amount,
+            due_date=due_date or timezone.localdate(),
+            note=(f"Fixed asset on credit - {description}".strip() or "Fixed asset on credit"),
+            is_paid=False,
+            is_asset=True,
+            asset_category=asset_category,
+        )
+        FixedAsset.objects.get_or_create(
+            account=account,
+            name=asset_name,
+            defaults={'category': asset_category, 'cost': amount, 'date_acquired': timezone.localdate()}
+        )
+        assets_row, _ = BalanceAssets.objects.get_or_create(account=account)
+        assets_row.fixed_assets = (assets_row.fixed_assets or Decimal('0')) + amount
+        assets_row.save(update_fields=['fixed_assets'])
+
+        # ✅ No Expense row
+        return Response({'message': 'Fixed asset (on credit) recorded.'}, status=status.HTTP_201_CREATED)
+
+    # -------------------- OPERATING EXPENSE PATH (non-asset) --------------------
+    if payment_method in ('cash', 'bank'):
+        # Recognize expense immediately (cash/bank basis)
         Expense.objects.create(
             account=account,
             amount=amount,
-            category=category,              # keep the real category (e.g., 'Utilities')
-            description=f"{description} (on credit)" if description else "On credit",
+            category=raw_category or 'Expense',
+            description=description,
             receipt=receipt
-            # optional: add a flag in the model like hits_income=True for cleaner filters
+        )
+        # Mirror outflow
+        remarks = f"Expense: {raw_category} - {description}".strip() or f"Expense: {raw_category or 'Expense'}"
+        CapitalTransaction.objects.create(
+            account_id=account.id,
+            amount=amount,
+            transaction_type='withdraw',
+            remarks=remarks
+        )
+        if payment_method == 'bank':
+            BankTransaction.objects.create(
+                account_id=account.id,
+                amount=amount,
+                transaction_type='withdraw',
+                remarks=remarks
+            )
+    else:
+        # CREDIT (accrual): recognize Expense and create Payable
+        Expense.objects.create(
+            account=account,
+            amount=amount,
+            category=raw_category or 'Expense',
+            description=(f"{description} (on credit)".strip() or "On credit"),
+            receipt=receipt
         )
         Payable.objects.create(
             account=account,
-            supplier_name=category or 'Expense',
+            supplier_name=raw_category or 'Expense',
             original_amount=amount,
             remaining_amount=amount,
-            due_date=parse_date(request.data.get('due_date')) or date.today(),
-            note=f"Expense on credit - {description}" if description else "Expense on credit",
+            due_date=due_date or timezone.localdate(),
+            note=(f"Expense on credit - {description}".strip() or "Expense on credit"),
             is_paid=False
         )
 
-    return Response({'message': 'Recorded.'}, status=201)
+    return Response({'message': 'Recorded.'}, status=status.HTTP_201_CREATED)
 
 
 
 @api_view(['GET'])
 def list_expenses(request):
-    """
-    GET /api/expenses/?account=12&start=YYYY-MM-DD&end=YYYY-MM-DD
-    Returns all non–Stock-In expenses for the given account.
-    """
+  
     account_id = request.GET.get('account') or request.GET.get('account_id')
     if not account_id:
         return Response({'error': 'account is required'}, status=400)
 
     qs = Expense.objects.filter(account_id=account_id)
 
-    # 🧹 Exclude stock-in related entries
+    # Exclude stock-in rows if any were created as Expense historically
     qs = qs.exclude(category__iexact='Inventory Purchase')
 
-    start = request.GET.get('start')
-    end = request.GET.get('end')
+    start = request.GET.get('start_date') or request.GET.get('start')
+    end   = request.GET.get('end_date')   or request.GET.get('end')
+
     if start:
         qs = qs.filter(created_at__date__gte=parse_date(start))
     if end:
@@ -579,27 +712,7 @@ from .models import (
 # THIS VIEW FOR RECORDING SALES ( RECORD SALES ) ----------------------------------------------------------------------------------------------------------------------------------------
 @api_view(['POST'])
 def record_sale(request):
-    """
-    POST /api/record-sale/
-    Body JSON (example):
-    {
-      "sale_type": "cash" | "utang",
-      "account_id": 12,
-      "or_num": "OR123" (optional),
-      "products": [
-        {"product_id": 5, "quantity": 2}
-        // or {"product_name": "Coke", "quantity": 2}
-      ],
-      "customer_data": {
-        "id": 99 (optional if existing),
-        "first_name": "...",
-        "last_name": "...",
-        "contact_num": "...",
-        "address": "...",
-        "due_date": "YYYY-MM-DD"
-      }
-    }
-    """
+    
     from decimal import Decimal
     sale_type = (request.data.get('sale_type') or 'cash').lower()
     raw_account_id = request.data.get('account_id')
@@ -948,12 +1061,21 @@ def edit_stockin_batch(request, batch_id):
 
 
 @api_view(['GET'])
-def get_product_batches(request, product_id):  # ← accept path param
+def get_product_batches(request):
+    """
+    GET /api/product-batches/?product_id=123&account=12
+    Returns remaining batches (qty > 0) for the product under the given account.
+    """
     account_id = request.GET.get('account') or request.GET.get('account_id')
+    product_id = request.GET.get('product_id')
+
     if not account_id:
         return Response({'error': 'account is required'}, status=400)
+    if not product_id:
+        return Response({'error': 'product_id is required'}, status=400)
 
     try:
+        # Optional: verify product belongs to this account
         product = Product.objects.get(id=product_id, account_id=account_id)
     except Product.DoesNotExist:
         return Response({'error': 'Product not found for this account'}, status=404)
@@ -1146,6 +1268,18 @@ def revenue_report(request):
     else:
         expenses_qs = expenses_qs.exclude(category__iexact="Inventory Purchase")
 
+    # 🔒 NEW: keep fixed assets out of P&L even if accidentally logged as Expense
+    asset_filters = (
+        Q(category__iexact='Fixed Assets (Equipment/Assets)') |
+        Q(category__iexact='Fixed Assets') |
+        Q(category__iexact='Fixed Asset') |
+        Q(category__iexact='Equipment') |
+        Q(category__iexact='Equipment/Assets') |
+        Q(category__iexact='Assets') |
+        Q(description__icontains='fixed asset')
+    )
+    expenses_qs = expenses_qs.exclude(asset_filters)
+
     # DO NOT exclude "Expense on Credit" anymore (accrual)
     expenses_total = expenses_qs.aggregate(total=Sum('amount'))['total'] or 0
 
@@ -1202,6 +1336,18 @@ def expenses_summary(request):
     else:
         qs = qs.exclude(category__iexact='Inventory Purchase')
 
+    # 🔒 NEW: exclude any fixed-asset-like expense rows (safety net)
+    asset_filters = (
+        Q(category__iexact='Fixed Assets (Equipment/Assets)') |
+        Q(category__iexact='Fixed Assets') |
+        Q(category__iexact='Fixed Asset') |
+        Q(category__iexact='Equipment') |
+        Q(category__iexact='Equipment/Assets') |
+        Q(category__iexact='Assets') |
+        Q(description__icontains='fixed asset')
+    )
+    qs = qs.exclude(asset_filters)
+
     # DO NOT exclude 'Expense on Credit' (we’re accrual now)
 
     qs = qs.filter(created_at__gte=start_dt_local,
@@ -1255,8 +1401,6 @@ def transactions_list(request):
     GET /api/transactions/?account=12&start=YYYY-MM-DD&end=YYYY-MM-DD&filter=all|sales|expenses|capital|cash
     Newest-first across Cash Sales, Credit (Utang), Customer Payments, Payable Payments, Expenses, and Cash (capital cashbook).
     """
-    from decimal import ROUND_HALF_UP
-
     account_id = request.GET.get("account") or request.GET.get("account_id")
     start_s = request.GET.get("start")
     end_s = request.GET.get("end")
@@ -1381,7 +1525,6 @@ def transactions_list(request):
             "_seq": e.id,
         })
 
-
     # -------------------- CUSTOMER PAYMENTS (still shown under Sales) --------------------
     pay_qs = CapitalTransaction.objects.filter(
         transaction_type='deposit',
@@ -1470,11 +1613,11 @@ def transactions_list(request):
 
         capital_list.append({
             "type": "capital",
-            "category": "Cash",                      # first label in UI
-            "description": desc,                     # second label (no 'Cash' duplication)
+            "category": "Capital",                  # first label in UI
+            "description": desc,                    # second label (no 'Cash' duplication)
             "amount": float(ct.amount),
             "sign": "+" if ct.transaction_type == "deposit" else "-",
-            "payment_method": ct.transaction_type,   # second row right side in UI
+            "payment_method": ct.transaction_type,  # second row right side in UI
             "date": sort_dt.isoformat(),
             "occurred_at": sort_dt.isoformat(),
             "_sort_dt": sort_dt.timestamp(),
@@ -1483,12 +1626,12 @@ def transactions_list(request):
 
     # -------------------- MERGE + FILTER + SORT --------------------
     combined = (
-        cash_list
-        + credit_list
-        + payments_list
-        + payable_payments_list
-        + expenses_list
-        + capital_list
+    cash_list
+    + credit_list
+    + payments_list
+    + payable_payments_list
+    + expenses_list
+    + capital_list
     )
 
     if filt == "sales":
@@ -1500,255 +1643,10 @@ def transactions_list(request):
 
     combined.sort(key=lambda x: (x["_sort_dt"], x["_seq"]), reverse=True)
 
+    # ✅ Normalize before returning so UI always renders "Capital*Deposit"
     for x in combined:
-        x.pop("_sort_dt", None)
-
-    return Response(combined)
-
-    """
-    GET /api/transactions/?account=12&start=YYYY-MM-DD&end=YYYY-MM-DD&filter=all|sales|expenses|capital|cash
-    Newest-first across Cash Sales, Credit (Utang), Customer Payments, Payable Payments, Expenses, and Cash (capital cashbook).
-    """
-    from decimal import ROUND_HALF_UP
-
-    account_id = request.GET.get("account") or request.GET.get("account_id")
-    start_s = request.GET.get("start")
-    end_s = request.GET.get("end")
-    filt = (request.GET.get("filter") or "all").lower()
-
-    # ✅ Accept 'cash' as an alias for the capital cashbook list
-    if filt == "cash":
-        filt = "capital"
-
-    start = parse_date(start_s) if start_s else None
-    end = parse_date(end_s) if end_s else None
-
-    # ✅ always initialize the lists to avoid UnboundLocalError
-    cash_list = []
-    credit_list = []
-    expenses_list = []
-    payments_list = []
-    payable_payments_list = []
-    capital_list = []
-
-    # -------------------- SALES: CASH --------------------
-    cash_qs = SalesCash.objects.select_related("product")
-    if account_id:
-        cash_qs = cash_qs.filter(account_id=account_id)
-    if start:
-        cash_qs = cash_qs.filter(created_at__date__gte=start)
-    if end:
-        cash_qs = cash_qs.filter(created_at__date__lte=end)
-    cash_qs = cash_qs.order_by("-created_at", "-id")
-
-    for sc in cash_qs:
-        sort_dt = sc.created_at
-        pname = sc.product.product_name if getattr(sc, "product_id", None) else None
-        desc = f"{pname} ({sc.quantity} pcs)" if pname else "Sale"
-        cash_list.append({
-            "type": "sale",
-            "category": "Sale",
-            "description": desc,
-            "amount": float(sc.amount or 0),
-            "payment_method": "Cash",  # second line shows Cash
-            "date": sort_dt.isoformat(),
-            "occurred_at": sort_dt.isoformat(),
-            "_sort_dt": sort_dt.timestamp(),
-            "_seq": sc.id,
-        })
-
-    # -------------------- SALES: CREDIT (UTANG) --------------------
-    credit_qs = SalesCredit.objects.select_related("product")
-    if account_id:
-        credit_qs = credit_qs.filter(account_id=account_id)
-    if start:
-        credit_qs = credit_qs.filter(created_at__date__gte=start)
-    if end:
-        credit_qs = credit_qs.filter(created_at__date__lte=end)
-    credit_qs = credit_qs.order_by("-created_at", "-id")
-
-    for cr in credit_qs:
-        # compute line total from sale items; fallback to remaining amount
-        try:
-            items = SaleItem.objects.filter(
-                sale_id=cr.sale_id,
-                stockin__product_id=cr.product_id
-            )
-            total_val = sum((i.unit_price or 0) * (i.quantity or 0) for i in items)
-            line_total = float(total_val)
-        except Exception:
-            line_total = float(cr.amount or 0)
-
-        # Clean title, no "(Utang)" and no "(Paid/Unpaid)"
-        pname = cr.product.product_name if getattr(cr, "product_id", None) and cr.product else None
-        desc = f"{pname} ({cr.quantity} pcs)" if pname else "Sale"
-
-        sort_dt = cr.created_at
-        credit_list.append({
-            "type": "sale",
-            "category": "Sale",
-            "description": desc,
-            "amount": line_total,
-            "payment_method": "Utang",  # second line shows Utang (requested)
-            "date": sort_dt.isoformat(),
-            "occurred_at": sort_dt.isoformat(),
-            "_sort_dt": sort_dt.timestamp(),
-            "_seq": cr.id,
-        })
-
-    # -------------------- EXPENSES --------------------
-    exp_qs = Expense.objects.select_related("product")
-    if account_id:
-        exp_qs = exp_qs.filter(account_id=account_id)
-    if start:
-        exp_qs = exp_qs.filter(created_at__date__gte=start)
-    if end:
-        exp_qs = exp_qs.filter(created_at__date__lte=end)
-    exp_qs = exp_qs.order_by("-created_at", "-id")
-
-    for e in exp_qs:
-        # 🛑 Skip Inventory Purchase (Stock-in) expenses
-        is_stockin = (
-            (e.category == Expense.INVENTORY_PURCHASE)
-            if hasattr(Expense, "INVENTORY_PURCHASE")
-            else (str(e.category or "").strip().lower() == "inventory purchase")
-        )
-        if is_stockin:
-            continue
-
-        desc = e.description or e.category or "Expense"
-        sort_dt = e.created_at
-        expenses_list.append({
-            "type": "expense",
-            "category": "Expense",
-            "description": desc,
-            "amount": float(e.amount or 0),
-            "payment_method": None,
-            "date": sort_dt.isoformat(),
-            "occurred_at": sort_dt.isoformat(),
-            "_sort_dt": sort_dt.timestamp(),
-            "_seq": e.id,
-        })
-
-    # -------------------- CUSTOMER PAYMENTS (still shown under Sales) --------------------
-    pay_qs = CapitalTransaction.objects.filter(
-        transaction_type='deposit',
-        remarks__icontains='Customer payment'
-    )
-    if account_id:
-        pay_qs = pay_qs.filter(account_id=account_id)
-    if start:
-        pay_qs = pay_qs.filter(date__date__gte=start)
-    if end:
-        pay_qs = pay_qs.filter(date__date__lte=end)
-    pay_qs = pay_qs.order_by('-date', '-id')
-
-    for ct in pay_qs:
-        sort_dt = ct.date
-        payments_list.append({
-            "type": "sale",
-            "category": "Customer Payment",
-            "description": ct.remarks or "Customer payment",
-            "amount": float(ct.amount),
-            "payment_method": "Cash",
-            "date": sort_dt.isoformat(),
-            "occurred_at": sort_dt.isoformat(),
-            "_sort_dt": sort_dt.timestamp(),
-            "_seq": ct.id,
-        })
-
-    # -------------------- PAYABLE PAYMENTS --------------------
-    pp_qs = PayablePayment.objects.select_related('payable')
-    if account_id:
-        pp_qs = pp_qs.filter(payable__account_id=account_id)
-    if start:
-        pp_qs = pp_qs.filter(created_at__date__gte=start)
-    if end:
-        pp_qs = pp_qs.filter(created_at__date__lte=end)
-    pp_qs = pp_qs.order_by('-created_at', '-id')
-
-    for pp in pp_qs:
-        sort_dt = pp.created_at
-        payable_payments_list.append({
-            "type": "expense",
-            "category": "Payable Payment",
-            "description": pp.note or f"Payment - {pp.payable.supplier_name}",
-            "amount": float(pp.amount),
-            "payment_method": None,
-            "date": sort_dt.isoformat(),
-            "occurred_at": sort_dt.isoformat(),
-            "_sort_dt": sort_dt.timestamp(),
-            "_seq": pp.id,
-        })
-
-    # -------------------- CASH (Capital cashbook) --------------------
-    cap_qs = CapitalTransaction.objects.all()
-    if account_id:
-        cap_qs = cap_qs.filter(account_id=account_id)
-    if start:
-        cap_qs = cap_qs.filter(date__date__gte=start)
-    if end:
-        cap_qs = cap_qs.filter(date__date__lte=end)
-    cap_qs = cap_qs.order_by('-date', '-id')
-
-    for ct in cap_qs:
-        sort_dt = ct.date
-
-        # Skip system-generated cashbook rows (except transfers)
-        if ct.remarks:
-            rm = ct.remarks.lower()
-            if (
-                "downpayment" in rm or
-                "payable" in rm or
-                ("payment" in rm and "customer" not in rm) or
-                "expense" in rm or
-                "stock-in" in rm or
-                "deleted product" in rm or
-                "cash sale" in rm or
-                "customer payment" in rm
-            ):
-                continue
-
-        # Decide label
-        rm = (ct.remarks or "").lower()
-        if "transfer" in rm or "bank" in rm:
-            desc = "BankTransfer"
-        else:
-            desc = "Deposit" if ct.transaction_type == "deposit" else "Withdraw"
-
-        capital_list.append({
-            "type": "capital",
-            "category": "Cash",                      # first label in UI
-            "description": desc,                     # second label (no 'Cash' duplication)
-            "amount": float(ct.amount),
-            "sign": "+" if ct.transaction_type == "deposit" else "-",
-            "payment_method": ct.transaction_type,   # second row right side in UI
-            "date": sort_dt.isoformat(),
-            "occurred_at": sort_dt.isoformat(),
-            "_sort_dt": sort_dt.timestamp(),
-            "_seq": ct.id,
-        })
-
-    # -------------------- MERGE + FILTER + SORT --------------------
-    combined = (
-        cash_list
-        + credit_list
-        + payments_list
-        + payable_payments_list
-        + expenses_list
-        + capital_list
-    )
-
-    if filt == "sales":
-        combined = [x for x in combined if x["type"] == "sale"]
-    elif filt == "expenses":
-        combined = [x for x in combined if x["type"] == "expense"]
-    elif filt == "capital":  # covers 'cash' too (mapped above)
-        combined = [x for x in combined if x["category"] in ("Capital", "Cash")]
-
-    combined.sort(key=lambda x: (x["_sort_dt"], x["_seq"]), reverse=True)
-
-    for x in combined:
+        if x.get("type") == "capital":
+            x["category"] = "Capital"     # <-- force Capital label
         x.pop("_sort_dt", None)
 
     return Response(combined)
@@ -2000,9 +1898,6 @@ class PayableViewSet(viewsets.ModelViewSet):
         # else: all
 
         return qs
-    
-    
-
 
     @action(detail=True, methods=['POST']) # type: ignore
     def mark_paid(self, request, pk=None):
@@ -2095,19 +1990,6 @@ def payables_summary(request):
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def balance_sheet(request):
-    """
-    GET /api/balance-sheet/?account=12
-      Optional:
-        &as_of=YYYY-MM-DD
-        or
-        &start=YYYY-MM-DD&end=YYYY-MM-DD
-
-    Accrual basis for expenses:
-      - Expense rows (cash or credit) hit NI when created.
-      - Paying a payable does NOT affect NI (just cash ↓, AP ↓).
-    Policy:
-      - Inventory = 0 (stock-in expensed immediately elsewhere by your policy)
-    """
     account_id = request.GET.get("account") or request.GET.get("account_id")
 
     as_of_s = request.GET.get("as_of")
@@ -2188,7 +2070,7 @@ def balance_sheet(request):
 
     total_revenue = revenue_cash + revenue_credit
 
-    # ---- Operating Expenses (ACCRUAL: include credit expenses; exclude only stock-in)
+    # ---- Operating Expenses (ACCRUAL: include credit expenses; exclude only stock-in and any asset-like rows)
     exp_qs = scoped(Expense.objects.all())
     exp_qs = between_dates(exp_qs, "created_at", start, end) if (start and end) else (as_of_date(exp_qs, "created_at", cutoff) if cutoff else exp_qs)
 
@@ -2197,6 +2079,18 @@ def balance_sheet(request):
         exp_qs = exp_qs.exclude(category=Expense.INVENTORY_PURCHASE)
     else:
         exp_qs = exp_qs.exclude(category__iexact="Inventory Purchase")
+
+    # 🔒 NEW: exclude fixed assets accidentally logged as Expense
+    asset_filters = (
+        Q(category__iexact='Fixed Assets (Equipment/Assets)') |
+        Q(category__iexact='Fixed Assets') |
+        Q(category__iexact='Fixed Asset') |
+        Q(category__iexact='Equipment') |
+        Q(category__iexact='Equipment/Assets') |
+        Q(category__iexact='Assets') |
+        Q(description__icontains='fixed asset')
+    )
+    exp_qs = exp_qs.exclude(asset_filters)
 
     # IMPORTANT: Do NOT exclude "Expense on Credit" anymore.
     # IMPORTANT: Do NOT add PayablePayment to expenses (payments don't hit NI).
@@ -2209,14 +2103,26 @@ def balance_sheet(request):
     accounts_receivable = _sum(ar_qs, "amount")
 
     inventory = Decimal("0")  # policy
+
     ap_qs = scoped(Payable.objects.filter(is_paid=False))
     ap_qs = as_of_date(ap_qs, "created_at", cutoff) if cutoff else ap_qs
     accounts_payable = ap_qs.aggregate(total=Sum("remaining_amount"))["total"] or Decimal("0")
 
-    # Fixed assets via flagged payables
-    fa_qs = scoped(Payable.objects.filter(is_asset=True))
-    fa_qs = as_of_date(fa_qs, "created_at", cutoff) if cutoff else fa_qs
-    fixed_assets = fa_qs.aggregate(total=Sum("original_amount"))["total"] or Decimal("0")
+    # ---- Fixed Assets (sum BOTH sources)
+    # 1) Payables flagged as assets
+    fa_pay_qs = scoped(Payable.objects.filter(is_asset=True))
+    fa_pay_qs = as_of_date(fa_pay_qs, "created_at", cutoff) if cutoff else fa_pay_qs
+    fixed_from_payables = fa_pay_qs.aggregate(total=Sum("original_amount"))["total"] or Decimal("0")
+
+    # 2) FixedAsset table (cash/bank asset purchases)
+    fa_fix_qs = FixedAsset.objects.all()
+    if account_id:
+        # FixedAsset likely relates via FK 'account' not 'account_id' property name; both are fine in Django filter
+        fa_fix_qs = fa_fix_qs.filter(account_id=account_id)
+    fa_fix_qs = as_of_date(fa_fix_qs, "date_acquired", cutoff) if cutoff else fa_fix_qs
+    fixed_from_fixedasset = fa_fix_qs.aggregate(total=Sum("cost"))["total"] or Decimal("0")
+
+    fixed_assets = (fixed_from_payables or Decimal("0")) + (fixed_from_fixedasset or Decimal("0"))
 
     # ---- Net Income & Equity
     cogs = Decimal("0")  # per your current policy
@@ -2445,11 +2351,21 @@ def balance_assets(request):
         .get("total") or Decimal("0")
     )
 
-    fixed_assets = (
+    # OLD (payables only)
+    fixed_from_payables = (
         Payable.objects.filter(account_id=account_id, is_asset=True)
         .aggregate(total=Sum("original_amount"))
         .get("total") or Decimal("0")
     )
+
+    # NEW (also FixedAsset table)
+    fixed_from_fixedasset = (
+        FixedAsset.objects.filter(account_id=account_id)
+        .aggregate(total=Sum("cost"))
+        .get("total") or Decimal("0")
+    )
+
+    fixed_assets = (fixed_from_payables or Decimal("0")) + (fixed_from_fixedasset or Decimal("0"))
 
     total_assets = cash_on_hand + cash_on_bank + receivables + fixed_assets
 
@@ -2462,125 +2378,155 @@ def balance_assets(request):
     }, status=200)
 
 
+def _aware_dt_from_date(d: date) -> datetime:
+    naive = datetime.combine(d, dt_time.min)
+    return timezone.make_aware(naive) if timezone.is_naive(naive) else naive
 
-
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def cashflow_simple(request):
+@api_view(['POST'])
+@parser_classes([MultiPartParser, FormParser])
+def expense_record(request):
     """
-    GET /api/reports/cashflow/?account=<id>&start=YYYY-MM-DD&end=YYYY-MM-DD
-    Returns only cash_in, cash_out, net, cash_begin, cash_end (+ optional lines).
-
-    Sources:
-      • CapitalTransaction (cash-on-hand)
-      • BankTransaction (cash-in-bank)
-
-    Rules:
-      • Include ALL deposits/withdrawals EXCEPT transfers ("transfer"/"bank" in remarks).
-      • This way, moving cash to bank (or vice versa) doesn't count as in/out.
+    POST /api/expenses/record/
+    Multipart/form-data.
+    Body:
+      account_id (int, required)
+      amount (decimal, required)
+      category (str)
+      description (str)
+      date (YYYY-MM-DD)  -> used for cash/bank rows (and Expense.created_at if possible)
+      payment_method: "cash" | "bank" | "credit" (default "cash")
+      is_fixed_asset: "true"/"false"
+      receipt: file (optional; stored only for Expense path)
     """
-    account_id = request.GET.get('account') or request.GET.get('account_id')
-    start_s = request.GET.get('start') or request.GET.get('start_date')
-    end_s   = request.GET.get('end')   or request.GET.get('end_date')
-
-    if not account_id or not start_s or not end_s:
-        return Response({"detail": "account, start, and end are required (YYYY-MM-DD)."}, status=400)
+    # -- parse/validate
+    try:
+        account_id = int(request.data.get('account_id'))
+    except (TypeError, ValueError):
+        return Response({'error': 'account_id is required and must be an integer'}, status=400)
 
     try:
-        account_id = int(account_id)
-    except ValueError:
-        return Response({"detail": "account must be an integer"}, status=400)
+        amount = Decimal(str(request.data.get('amount', 0))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    except Exception:
+        return Response({'error': 'Invalid amount'}, status=400)
+    if amount <= 0:
+        return Response({'error': 'Amount must be greater than 0.'}, status=400)
 
-    start = parse_date(start_s)
-    end   = parse_date(end_s)
-    if not start or not end:
-        return Response({"detail": "Invalid date format. Use YYYY-MM-DD."}, status=400)
-    if end < start:
-        start, end = end, start
+    category     = (request.data.get('category') or '').strip() or 'Expense'
+    description  = (request.data.get('description') or '').strip()
+    payment_meth = (request.data.get('payment_method') or 'cash').strip().lower()
+    is_fixed     = str(request.data.get('is_fixed_asset', '')).lower() in ('1', 'true', 'yes')
+    receipt      = request.FILES.get('receipt')
 
-    def _sum(qs, field='amount') -> Decimal:
-        return qs.aggregate(total=Sum(field))['total'] or Decimal('0')
+    date_s   = request.data.get('date')
+    sel_date = parse_date(date_s) if date_s else timezone.localdate()
+    if not sel_date:
+        return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=400)
+    dt_for_rows = _aware_dt_from_date(sel_date)
 
-    # ---------- balances BEFORE start (begin) ----------
-    cap_before = CapitalTransaction.objects.filter(account_id=account_id, date__lt=start)
-    bank_before = BankTransaction.objects.filter(account_id=account_id, date__lt=start)
+    # server-side guard for cash
+    if payment_meth == 'cash':
+        on_hand = _cashbook_balance(account_id)
+        if amount > on_hand:
+            return Response({'error': 'Insufficient cash on hand.'}, status=400)
 
-    cash_on_hand_begin = _sum(cap_before.filter(transaction_type='deposit')) - _sum(cap_before.filter(transaction_type='withdraw'))
-    cash_in_bank_begin = _sum(bank_before.filter(transaction_type='deposit')) - _sum(bank_before.filter(transaction_type='withdraw'))
-    cash_begin = cash_on_hand_begin + cash_in_bank_begin
+    with transaction.atomic():
+        if is_fixed:
+            # ---- Fixed Asset path (NO Expense row) ----
+            pay = Payable.objects.create(
+                account_id=account_id,
+                supplier_name=category or 'Fixed Asset',
+                item=description or 'Fixed Asset',
+                original_amount=amount,
+                remaining_amount=Decimal('0.00'),
+                is_paid=True,                 # paid now
+                due_date=sel_date,
+                note=f"Fixed Asset purchase - {description}" if description else "Fixed Asset purchase",
+                is_asset=True                 # <-- lets balance sheet pick it up as Fixed Assets
+            )
 
-    # ---------- balances UP TO end (end) ----------
-    cap_to_end = CapitalTransaction.objects.filter(account_id=account_id, date__lte=end)
-    bank_to_end = BankTransaction.objects.filter(account_id=account_id, date__lte=end)
+            # cash/bank outflow
+            CapitalTransaction.objects.create(
+                account_id=account_id,
+                amount=amount,
+                transaction_type='withdraw',
+                remarks=f"Fixed Asset: {pay.item or pay.supplier_name}",
+                date=dt_for_rows
+            )
+            if payment_meth == 'bank':
+                BankTransaction.objects.create(
+                    account_id=account_id,
+                    amount=amount,
+                    transaction_type='withdraw',
+                    remarks=f"Fixed Asset: {pay.item or pay.supplier_name}",
+                    date=dt_for_rows
+                )
 
-    cash_on_hand_end = _sum(cap_to_end.filter(transaction_type='deposit')) - _sum(cap_to_end.filter(transaction_type='withdraw'))
-    cash_in_bank_end = _sum(bank_to_end.filter(transaction_type='deposit')) - _sum(bank_to_end.filter(transaction_type='withdraw'))
-    cash_end = cash_on_hand_end + cash_in_bank_end
+            return Response({'status': 'success', 'message': 'Fixed asset recorded.'}, status=201)
 
-    # ---------- period range ----------
-    from datetime import datetime as _dt, time as _t
-    cap_range = CapitalTransaction.objects.filter(
-        account_id=account_id,
-        date__gte=_dt.combine(start, _t.min),
-        date__lte=_dt.combine(end, _t.max),
-    )
-    bank_range = BankTransaction.objects.filter(
-        account_id=account_id,
-        date__gte=_dt.combine(start, _t.min),
-        date__lte=_dt.combine(end, _t.max),
-    )
+        # ---- Regular Expense path ----
+        exp = Expense.objects.create(
+            account_id=account_id,
+            amount=amount,
+            category=category,
+            description=description,
+            receipt=receipt
+        )
+        # backdate if model allows
+        try:
+            if hasattr(exp, 'date'):
+                exp.date = sel_date
+                exp.save(update_fields=['date'])
+            elif hasattr(exp, 'created_at'):
+                exp.created_at = dt_for_rows
+                exp.save(update_fields=['created_at'])
+        except Exception:
+            pass  # ignore if auto_now_add prevents update
 
-    # Exclude transfers on both sides
-    def _no_transfer(qs):
-        return qs.exclude(remarks__icontains='transfer').exclude(remarks__icontains='bank')
+        CapitalTransaction.objects.create(
+            account_id=account_id,
+            amount=amount,
+            transaction_type='withdraw',
+            remarks=f"Expense: {category} - {description}" if description else f"Expense: {category}",
+            date=dt_for_rows
+        )
+        if payment_meth == 'bank':
+            BankTransaction.objects.create(
+                account_id=account_id,
+                amount=amount,
+                transaction_type='withdraw',
+                remarks=f"Expense: {category} - {description}" if description else f"Expense: {category}",
+                date=dt_for_rows
+            )
 
-    cap_deposits    = _no_transfer(cap_range.filter(transaction_type='deposit'))
-    cap_withdrawals = _no_transfer(cap_range.filter(transaction_type='withdraw'))
-
-    bank_deposits    = _no_transfer(bank_range.filter(transaction_type='deposit'))
-    bank_withdrawals = _no_transfer(bank_range.filter(transaction_type='withdraw'))
-
-    cash_in  = _sum(cap_deposits) + _sum(bank_deposits)
-    cash_out = _sum(cap_withdrawals) + _sum(bank_withdrawals)
-    net = cash_in - cash_out
-
-    # Optional: simple lines so you can show details if you want
-    lines = [
-        {"group": "Cash In",  "label": "Cash-on-hand deposits", "amount": round(_sum(cap_deposits), 2)},
-        {"group": "Cash In",  "label": "Bank deposits",         "amount": round(_sum(bank_deposits), 2)},
-        {"group": "Cash Out", "label": "Cash withdrawals",      "amount": round(_sum(cap_withdrawals), 2)},
-        {"group": "Cash Out", "label": "Bank withdrawals",      "amount": round(_sum(bank_withdrawals), 2)},
-    ]
-
-    return Response({
-        "start": start_s,
-        "end": end_s,
-        "cash_in": round(cash_in, 2),
-        "cash_out": round(cash_out, 2),
-        "net": round(net, 2),
-        "cash_begin": round(cash_begin, 2),
-        "cash_end": round(cash_end, 2),
-        "lines": lines,
-    }, status=200)
-
-
+        return Response({'status': 'success', 'message': 'Expense recorded.'}, status=201)
+    
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def bank_balance(request):
     """
-    GET /api/bank/?account_id=123
-    Returns {"balance": 123.45}
+    GET /api/bank/?account_id=123   (your urls.py has: path('bank/', views.bank_balance, ...))
+    Returns: {"balance": 123.45}
     """
-    account_id = request.GET.get('account_id')
+    account_id = request.GET.get('account_id') or request.GET.get('account')
     if not account_id:
-        return Response({'error': 'account_id is required'}, status=400)
+        return Response({'error': 'account_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
     try:
         account_id = int(account_id)
     except ValueError:
-        return Response({'error': 'account_id must be an integer'}, status=400)
+        return Response({'error': 'account_id must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
 
-    bal = compute_bank_balance(account_id)  # you already have this helper
-    return Response({'balance': float(bal)}, status=200)
+    deposits = (BankTransaction.objects
+                .filter(account_id=account_id, transaction_type='deposit')
+                .aggregate(total=Sum('amount'))['total'] or Decimal('0'))
+    withdrawals = (BankTransaction.objects
+                   .filter(account_id=account_id, transaction_type='withdraw')
+                   .aggregate(total=Sum('amount'))['total'] or Decimal('0'))
+
+    balance = deposits - withdrawals
+    return Response({'balance': float(balance)}, status=status.HTTP_200_OK)
+
+    
 
 @api_view(['POST'])
 def transfer_from_bank(request):
@@ -2591,14 +2537,13 @@ def transfer_from_bank(request):
     Effect:
       - Creates BankTransaction(withdraw) with standardized "Transfer from bank ..." remark
       - Creates CapitalTransaction(deposit) for the same amount
-      - Validates sufficient bank balance
+      - Validates sufficient BANK balance
     """
     # --- read & validate payload ---
     try:
         account_id = int(request.data.get('account_id'))
     except (TypeError, ValueError):
-        return Response({'error': 'account_id is required and must be an integer'},
-                        status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': 'account_id is required and must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         amount = Decimal(str(request.data.get('amount', 0))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
@@ -2610,19 +2555,15 @@ def transfer_from_bank(request):
 
     user_note = (request.data.get('remarks') or '').strip()
 
-    bank_deposits = BankTransaction.objects.filter(account_id=account_id, transaction_type='deposit') \
-                                           .aggregate(total=Sum('amount'))['total'] or Decimal('0')
-    bank_withdraws = BankTransaction.objects.filter(account_id=account_id, transaction_type='withdraw') \
-                                            .aggregate(total=Sum('amount'))['total'] or Decimal('0')
-    bank_balance = bank_deposits - bank_withdraws
-
+    # --- guard: sufficient BANK balance ---
+    bank_balance = compute_bank_balance(account_id)  # you already have this helper
     if amount > bank_balance:
-        return Response({'error': 'Insufficient bank balance.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': 'Insufficient cash in bank.'}, status=status.HTTP_400_BAD_REQUEST)
 
+    # --- do the move atomically ---
     now = timezone.now()
     std_remark = f"Transfer from bank{': ' + user_note if user_note else ''}"
 
-    # --- do the move atomically ---
     with transaction.atomic():
         # 1) bank withdraw
         bank = BankTransaction.objects.create(
@@ -2632,12 +2573,12 @@ def transfer_from_bank(request):
             remarks=std_remark,
             date=now
         )
-        # 2) cashbook deposit
+        # 2) cashbook (capital) deposit
         cap = CapitalTransaction.objects.create(
             account_id=account_id,
             amount=amount,
             transaction_type='deposit',
-            remarks=std_remark,
+            remarks=std_remark,  # contains 'transfer' & 'bank' so owner equity calc excludes it
             date=now
         )
 
@@ -2647,4 +2588,3 @@ def transfer_from_bank(request):
         'capital_tx_id': cap.id,
         'message': 'Transfer recorded successfully.'
     }, status=status.HTTP_201_CREATED)
-
