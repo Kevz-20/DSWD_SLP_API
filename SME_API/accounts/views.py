@@ -37,6 +37,7 @@ from decimal import Decimal
 from django.db.models import Q # type: ignore
 from datetime import date as _dt_date, datetime as _dt_datetime
 from django.utils.dateparse import parse_date as _dj_parse_date # type: ignore
+from django.conf import settings # type: ignore
 
 def _coerce_date(value):
     """
@@ -506,172 +507,179 @@ def delete_inventory(request):
 
     return Response({'message': 'Deleted quantity from batch and recorded expense.'}, status=status.HTTP_200_OK)
 
+def _dt_from_date_for_db(d):
+    """
+    Given a date, return a datetime appropriate for DB writes:
+      - naive when USE_TZ=False (SQLite requires naive dt)
+      - aware (current timezone) when USE_TZ=True
+    """
+    from datetime import datetime, time as dt_time
+    naive = datetime.combine(d, dt_time.min)
+    return (
+        timezone.make_aware(naive, timezone.get_current_timezone())
+        if getattr(settings, "USE_TZ", False) else
+        naive
+    )
 
 # THIS VIEW FOR RECORD EXPENSES BILLS, UTILITIES ETC ( RECORD EXPENSES ) -----------------------------------
 @api_view(['POST'])
 def record_expense(request):
-    """
-    Records an operating expense OR a fixed asset purchase.
-
-    Rules:
-      • Fixed assets are recorded in FixedAsset (and as Payable if credit) — NOT in Expense.
-      • Cash/bank outflows are mirrored to CapitalTransaction (and BankTransaction for bank).
-      • For credit expenses (non-asset): create Expense + Payable (accrual basis).
-      • For credit fixed assets: create Payable(is_asset=True) + FixedAsset stub and bump BalanceAssets.
-    """
     from decimal import Decimal
 
-    # --- Validate account_id ---
+    # --- account & amount ---
     try:
         account_id = int(request.data.get('account_id'))
     except (TypeError, ValueError):
-        return Response({'error': 'account_id is required and must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': 'account_id is required and must be an integer'}, status=400)
 
-    # --- Validate amount ---
     try:
         amount = Decimal(str(request.data.get('amount'))).quantize(Decimal('0.01'))
     except Exception:
-        return Response({'error': 'Invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': 'Invalid amount'}, status=400)
     if amount <= 0:
-        return Response({'error': 'Amount must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': 'Amount must be greater than 0.'}, status=400)
 
-    # --- Inputs ---
     raw_category   = (request.data.get('category') or '').strip()
     description    = (request.data.get('description') or '').strip()
-    payment_method = (request.data.get('payment_method') or 'cash').strip().lower()  # 'cash'|'bank'|'credit'
+    payment_method = (request.data.get('payment_method') or 'cash').strip().lower()  # cash|bank|credit
     receipt        = request.FILES.get('receipt')
 
-    # credit-only
-    raw_due  = request.data.get('due_date')
-    due_date = _coerce_date(raw_due)
-    if raw_due not in (None, '',) and due_date is None:
-        return Response({'error': 'Invalid due_date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+    # dates
+    raw_date = request.data.get('date')
+    use_date = _coerce_date(raw_date) or timezone.localdate()       # DateField use
+    use_dt   = _dt_from_date_for_db(use_date)                       # DateTimeField use
 
-    # fetch account
+    # credit-only due date
+    due_date = _coerce_date(request.data.get('due_date'))
+
+    # account
     try:
         account = Account.objects.get(id=account_id)
     except Account.DoesNotExist:
-        return Response({'error': 'Account not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'error': 'Account not found'}, status=404)
 
-    # 🔎 Categories that should be treated as Fixed Assets (case-insensitive exact match)
+    # classify fixed asset
     FIXED_ASSET_KEYS = {
-        'fixed assets (equipment/assets)',
-        'fixed assets',
-        'fixed asset',
-        'equipment',
-        'equipment/assets',
-        'assets',
+        'fixed assets (equipment/assets)','fixed assets','fixed asset',
+        'equipment','equipment/assets','assets',
     }
-    is_fixed_asset = raw_category.lower() in FIXED_ASSET_KEYS
+    is_fixed_asset = raw_category.lower() in FIXED_ASSET_KEYS or \
+                     str(request.data.get('is_fixed_asset', '')).lower() in ('1','true','yes')
 
-    # -------------------- FIXED ASSET PATH --------------------
+    # ---------------- FIXED ASSET ----------------
     if is_fixed_asset:
         asset_name     = description or raw_category or 'Fixed Asset'
-        asset_category = 'equipment'  # adjust as needed
+        asset_category = 'equipment'
 
-        if payment_method in ('cash', 'bank'):
-            # 1) Create FixedAsset
-            FixedAsset.objects.create(
+        if payment_method == 'credit':
+            # On-credit asset: create payable (is_asset=True) and (optionally) a FixedAsset stub
+            Payable.objects.create(
+                account=account,
+                supplier_name=asset_name,
+                item=asset_name,
+                original_amount=amount,
+                remaining_amount=amount,
+                due_date=due_date or use_date,
+                note=(f"Fixed asset on credit - {description}".strip() or "Fixed asset on credit"),
+                is_paid=False,
+                is_asset=True,
+                asset_category=asset_category,
+            )
+            FixedAsset.objects.get_or_create(
                 account=account,
                 name=asset_name,
-                category=asset_category,
-                cost=amount,
-                date_acquired=timezone.now().date(),
+                defaults={'category': asset_category, 'cost': amount, 'date_acquired': use_date}
             )
+            return Response({'message': 'Fixed asset (on credit) recorded.'}, status=201)
 
-            # 2) Update BalanceAssets materialized tally
-            assets_row, _ = BalanceAssets.objects.get_or_create(account=account)
-            assets_row.fixed_assets = (assets_row.fixed_assets or Decimal('0')) + amount
-            assets_row.save(update_fields=['fixed_assets'])
-
-            # 3) Mirror outflow to cash/bank ledgers
-            CapitalTransaction.objects.create(
-                account=account,
-                amount=amount,
-                transaction_type='withdraw',
-                remarks=f"Fixed Asset: {asset_name} ({asset_category})"
-            )
-            if payment_method == 'bank':
-                BankTransaction.objects.create(
-                    account=account,
-                    amount=amount,
-                    transaction_type='withdraw',
-                    remarks=f"Fixed Asset: {asset_name} ({asset_category})"
-                )
-
-            # ✅ No Expense row for assets
-            return Response({'message': 'Fixed asset recorded.'}, status=status.HTTP_201_CREATED)
-
-        # --- CREDIT: record as Payable(is_asset=True); also create a FixedAsset stub; bump BalanceAssets ---
-        Payable.objects.create(
-            account=account,
-            supplier_name=asset_name or 'Fixed Asset',
-            item=asset_name,
-            original_amount=amount,
-            remaining_amount=amount,
-            due_date=due_date or timezone.localdate(),
-            note=(f"Fixed asset on credit - {description}".strip() or "Fixed asset on credit"),
-            is_paid=False,
-            is_asset=True,
-            asset_category=asset_category,
-        )
-        FixedAsset.objects.get_or_create(
+        # cash/bank asset: create FixedAsset + reduce cash/bank (NOT equity)
+        FixedAsset.objects.create(
             account=account,
             name=asset_name,
-            defaults={'category': asset_category, 'cost': amount, 'date_acquired': timezone.localdate()}
+            category=asset_category,
+            cost=amount,
+            date_acquired=use_date,
         )
         assets_row, _ = BalanceAssets.objects.get_or_create(account=account)
         assets_row.fixed_assets = (assets_row.fixed_assets or Decimal('0')) + amount
         assets_row.save(update_fields=['fixed_assets'])
 
-        # ✅ No Expense row
-        return Response({'message': 'Fixed asset (on credit) recorded.'}, status=status.HTTP_201_CREATED)
+        # Outflow to cash/bank (remarks include 'asset' so equity calc excludes)
+        CapitalTransaction.objects.create(
+            account=account,
+            amount=amount,
+            transaction_type='withdraw',
+            remarks=f"Fixed Asset: {asset_name} ({asset_category})",
+            date=use_dt
+        )
+        if payment_method == 'bank':
+            BankTransaction.objects.create(
+                account=account,
+                amount=amount,
+                transaction_type='withdraw',
+                remarks=f"Fixed Asset: {asset_name} ({asset_category})",
+                date=use_dt
+            )
 
-    # -------------------- OPERATING EXPENSE PATH (non-asset) --------------------
-    if payment_method in ('cash', 'bank'):
-        # Recognize expense immediately (cash/bank basis)
-        Expense.objects.create(
+        return Response({'message': 'Fixed asset recorded.'}, status=201)
+
+    # --------------- OPERATING EXPENSE ----------------
+    if payment_method in ('cash','bank'):
+        exp = Expense.objects.create(
             account=account,
             amount=amount,
             category=raw_category or 'Expense',
             description=description,
             receipt=receipt
         )
-        # Mirror outflow
+        # Optional backdate if fields allow
+        try:
+            if hasattr(exp, 'date'):
+                exp.date = use_date
+                exp.save(update_fields=['date'])
+            elif hasattr(exp, 'created_at'):
+                exp.created_at = use_dt
+                exp.save(update_fields=['created_at'])
+        except Exception:
+            pass
+
         remarks = f"Expense: {raw_category} - {description}".strip() or f"Expense: {raw_category or 'Expense'}"
         CapitalTransaction.objects.create(
             account_id=account.id,
             amount=amount,
             transaction_type='withdraw',
-            remarks=remarks
+            remarks=remarks,
+            date=use_dt
         )
         if payment_method == 'bank':
             BankTransaction.objects.create(
                 account_id=account.id,
                 amount=amount,
                 transaction_type='withdraw',
-                remarks=remarks
+                remarks=remarks,
+                date=use_dt
             )
-    else:
-        # CREDIT (accrual): recognize Expense and create Payable
-        Expense.objects.create(
-            account=account,
-            amount=amount,
-            category=raw_category or 'Expense',
-            description=(f"{description} (on credit)".strip() or "On credit"),
-            receipt=receipt
-        )
-        Payable.objects.create(
-            account=account,
-            supplier_name=raw_category or 'Expense',
-            original_amount=amount,
-            remaining_amount=amount,
-            due_date=due_date or timezone.localdate(),
-            note=(f"Expense on credit - {description}".strip() or "Expense on credit"),
-            is_paid=False
-        )
+        return Response({'message': 'Recorded.'}, status=201)
 
-    return Response({'message': 'Recorded.'}, status=status.HTTP_201_CREATED)
+    # credit (non-asset): accrue expense + payable (no cash movement)
+    Expense.objects.create(
+        account=account,
+        amount=amount,
+        category=raw_category or 'Expense',
+        description=(f"{description} (on credit)".strip() or "On credit"),
+        receipt=receipt
+    )
+    Payable.objects.create(
+        account=account,
+        supplier_name=raw_category or 'Expense',
+        original_amount=amount,
+        remaining_amount=amount,
+        due_date=due_date or use_date,
+        note=(f"Expense on credit - {description}".strip() or "Expense on credit"),
+        is_paid=False
+    )
+    return Response({'message': 'Recorded.'}, status=201)
+
 
 
 
@@ -2279,7 +2287,7 @@ def _cashbook_balance(account_id: int) -> Decimal:
 OWNER_SYSTEM_KEYWORDS = [
     # anything system-generated we do NOT want counted as owner equity
     'cash sale', 'customer payment', 'expense', 'payable',
-    'downpayment', 'stock-in', 'deleted product','transfer','bank'
+    'downpayment', 'stock-in', 'deleted product','transfer','bank','asset'
 ]
 
 def compute_owner_capital(account_id: int) -> Decimal:
@@ -2378,9 +2386,10 @@ def balance_assets(request):
     }, status=200)
 
 
-def _aware_dt_from_date(d: date) -> datetime:
+def _dt_for_rows(d: dt_date) -> datetime:
+
     naive = datetime.combine(d, dt_time.min)
-    return timezone.make_aware(naive) if timezone.is_naive(naive) else naive
+    return timezone.make_aware(naive) if settings.USE_TZ else naive
 
 @api_view(['POST'])
 @parser_classes([MultiPartParser, FormParser])
@@ -2421,7 +2430,7 @@ def expense_record(request):
     sel_date = parse_date(date_s) if date_s else timezone.localdate()
     if not sel_date:
         return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=400)
-    dt_for_rows = _aware_dt_from_date(sel_date)
+    dt_for_rows = _dt_from_date_for_db(sel_date)  # DateTimeField-safe (naive if USE_TZ=False)
 
     # server-side guard for cash
     if payment_meth == 'cash':
@@ -2441,7 +2450,7 @@ def expense_record(request):
                 is_paid=True,                 # paid now
                 due_date=sel_date,
                 note=f"Fixed Asset purchase - {description}" if description else "Fixed Asset purchase",
-                is_asset=True                 # <-- lets balance sheet pick it up as Fixed Assets
+                is_asset=True                 # lets balance sheet pick it up as Fixed Assets
             )
 
             # cash/bank outflow
